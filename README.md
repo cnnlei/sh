@@ -18,5 +18,5 @@
 请使用 `root` 用户或有 `sudo` 权限的用户，在终端中执行以下命令：
 
 ```bash
-curl -sSL [https://raw.githubusercontent.com/cnnlei/sh/main/gost-mwss.sh](https://raw.githubusercontent.com/cnnlei/sh/main/gost-mwss.sh) | sudo bash
+curl -sSL https://raw.githubusercontent.com/cnnlei/sh/main/gost-mwss.sh | sudo bash
 ```
