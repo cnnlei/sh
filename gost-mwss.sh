@@ -2,8 +2,8 @@
 
 # --- 脚本信息 ---
 # 名称: Gost-MWSS 多服务管理脚本
-# 版本: v1.2
-# 更新: 修复 curl | bash 执行时因 stdin 冲突导致的闪屏问题。
+# 版本: v1.7
+# 更新: 强制为新服务和备份逻辑添加“mwss”标识。
 # 功能: 使用 'function' 关键字定义所有函数，以兼容ash/busybox等极简shell环境。
 # =================================================
 
@@ -164,8 +164,17 @@ function view_service_details() {
 
 function add_new_service() {
     echo -e "${CYAN}--- 添加新的 Gost-MWSS 服务 ---${NC}"
-    read -p ">> 请输入一个唯一的服务名称 (例如: myline1): " SERVICE_NAME < /dev/tty
-    if [ -z "$SERVICE_NAME" ]; then echo -e "${RED}错误: 服务名称不能为空。${NC}"; return; fi
+    read -p ">> 请输入一个唯一的服务基础名称 (例如: myline1): " SERVICE_BASE_NAME < /dev/tty
+    if [ -z "$SERVICE_BASE_NAME" ]; then echo -e "${RED}错误: 服务名称不能为空。${NC}"; return; fi
+    
+    local SERVICE_NAME
+    if [[ "$SERVICE_BASE_NAME" == mwss_* ]]; then
+        SERVICE_NAME="$SERVICE_BASE_NAME"
+    else
+        SERVICE_NAME="mwss_${SERVICE_BASE_NAME}"
+    fi
+    echo -e "${YELLOW}--> 完整服务名将为: ${CYAN}${SERVICE_NAME}${NC}"
+
     if [[ ! "$SERVICE_NAME" =~ ^[a-zA-Z0-9_-]+$ ]]; then echo -e "${RED}错误: 服务名称只能包含字母、数字、下划线和连字符。${NC}"; return; fi
     if [ -f "${SERVICE_DIR}/${SERVICE_PREFIX}${SERVICE_NAME}.service" ]; then echo -e "${RED}错误: 名为 '${SERVICE_NAME}' 的服务已存在。${NC}"; return; fi
     
@@ -449,13 +458,133 @@ function manage_autostart() {
     echo -e "--> 当前开机自启状态: ${CYAN}${enabled_status}${NC}"
 }
 
-
 function view_logs() {
     local SERVICE_NAME
     SERVICE_NAME=$(select_service)
     if [ $? -ne 0 ]; then echo -e "${YELLOW}操作已取消。${NC}"; return; fi
     echo -e "${YELLOW}正在加载日志... 按 Ctrl+C 退出日志查看。${NC}"
     journalctl -u "${SERVICE_PREFIX}${SERVICE_NAME}.service" -f -n 50 --no-pager
+}
+
+function backup_services() {
+    echo -e "${CYAN}--- 备份所有服务配置 ---${NC}"
+    local service_files
+    # 只查找并备份带 mwss_ 前缀的服务
+    service_files=($(find "$SERVICE_DIR" -maxdepth 1 -name "${SERVICE_PREFIX}mwss_*.service"))
+
+    if [ ${#service_files[@]} -eq 0 ]; then
+        echo -e "${YELLOW}未找到任何需要备份的 Gost-MWSS 服务配置文件 (gost_mwss_*.service)。${NC}"
+        return
+    fi
+    
+    read -p ">> 请输入备份文件保存目录 [默认: /root/gost_backups]: " backup_dir < /dev/tty
+    backup_dir=${backup_dir:-/root/gost_backups}
+    mkdir -p "$backup_dir"
+
+    local backup_filename="mwss_gost_backup_$(date +%Y%m%d_%H%M%S).tar.gz"
+    local backup_filepath="${backup_dir}/${backup_filename}"
+
+    echo "--> 找到 ${#service_files[@]} 个服务配置文件，正在打包..."
+    
+    # 使用 -C 选项来避免在压缩包中包含完整路径
+    tar -czf "$backup_filepath" -C "$SERVICE_DIR" $(for f in "${service_files[@]}"; do echo "${f##*/}"; done)
+
+    if [ $? -eq 0 ]; then
+        echo -e "${GREEN}=====================================================${NC}"
+        echo -e "${GREEN} 所有服务配置备份成功! ${NC}"
+        echo -e "${GREEN}=====================================================${NC}"
+        echo -e "备份文件已保存到: ${YELLOW}${backup_filepath}${NC}"
+    else
+        echo -e "${RED}备份失败！请检查目录权限或剩余空间。${NC}"
+    fi
+}
+
+function restore_services() {
+    echo -e "${CYAN}--- 从备份恢复配置 ---${NC}"
+
+    read -p ">> 请输入备份文件所在的目录 [默认: /root/gost_backups]: " backup_dir < /dev/tty
+    backup_dir=${backup_dir:-/root/gost_backups}
+
+    if [ ! -d "$backup_dir" ]; then
+        echo -e "${RED}错误: 目录 '${backup_dir}' 不存在。${NC}"
+        return
+    fi
+
+    local backup_files
+    mapfile -t backup_files < <(find "$backup_dir" -maxdepth 1 -type f -name "*.tar.gz" | sort -r)
+
+    if [ ${#backup_files[@]} -eq 0 ]; then
+        echo -e "${YELLOW}在目录 '${backup_dir}' 中未找到任何备份文件 (*.tar.gz)。${NC}"
+        return
+    fi
+
+    echo -e "${CYAN}--- 请选择要恢复的备份文件 (最新的在最上面) ---${NC}"
+    local backup_filepath
+    select selected_file in "${backup_files[@]}" "返回主菜单"; do
+        case "$selected_file" in
+            "返回主菜单")
+                echo -e "${YELLOW}操作已取消。${NC}"
+                return
+                ;;
+            "")
+                echo -e "${RED}无效的输入，请输入列表中的数字。${NC}" >&2
+                ;;
+            *)
+                backup_filepath="$selected_file"
+                break
+                ;;
+        esac
+    done < /dev/tty
+
+    echo "您选择了: ${CYAN}${backup_filepath}${NC}"
+    
+    echo ""
+    echo -e "${RED}警告: 这是一个危险操作！${NC}"
+    echo -e "${YELLOW}此操作将使用备份文件中的配置覆盖 /etc/systemd/system/ 目录下的同名服务。${NC}"
+    read -p ">> 您确定要继续吗? 请输入 'yes' 以确认: " confirm_restore < /dev/tty
+
+    if [ "$confirm_restore" != "yes" ]; then
+        echo -e "${YELLOW}操作已取消。${NC}"
+        return
+    fi
+
+    # 获取要恢复的服务列表
+    local restored_services
+    mapfile -t restored_services < <(tar -tf "$backup_filepath" | grep ".service$")
+    
+    if [ ${#restored_services[@]} -eq 0 ]; then
+        echo -e "${RED}错误: 备份文件中未找到任何有效的服务(.service)文件。${NC}"
+        return
+    fi
+
+    echo "--> 正在从 '${backup_filepath##*/}' 解压并恢复 ${#restored_services[@]} 个服务..."
+    tar -xzf "$backup_filepath" -C "$SERVICE_DIR"
+    
+    if [ $? -eq 0 ]; then
+        echo "--> 正在重载 systemd 配置..."
+        systemctl daemon-reload
+
+        echo "--> 正在启用并启动所有已恢复的服务..."
+        for service_fullname in "${restored_services[@]}"; do
+            local short_name=${service_fullname#"$SERVICE_PREFIX"}
+            short_name=${short_name%".service"}
+            
+            echo -n "    -> 正在启用 '${short_name}' 开机自启..."
+            systemctl enable "$service_fullname" > /dev/null 2>&1
+            if [ $? -eq 0 ]; then echo -e " ${GREEN}成功${NC}"; else echo -e " ${RED}失败${NC}"; fi
+
+            echo -n "    -> 正在启动 '${short_name}'..."
+            systemctl start "$service_fullname" > /dev/null 2>&1
+            if [ $? -eq 0 ]; then echo -e " ${GREEN}成功${NC}"; else echo -e " ${RED}失败${NC}"; fi
+        done
+
+        echo -e "${GREEN}=====================================================${NC}"
+        echo -e "${GREEN} 配置恢复成功! ${NC}"
+        echo -e "${GREEN}=====================================================${NC}"
+        echo -e "${YELLOW}所有服务已尝试自动启用并启动，请检查上方日志或返回主菜单确认状态。${NC}"
+    else
+        echo -e "${RED}恢复失败！请检查备份文件是否有效或目录权限。${NC}"
+    fi
 }
 
 function update_gost_binary(){
@@ -663,11 +792,23 @@ function generate_self_signed_cert() {
 
 function install_script() {
     echo -e "${CYAN}--- 安装/更新 gost-mwss 快捷命令 ---${NC}"
-    local SCRIPT_PATH
-    SCRIPT_PATH=$(readlink -f "$0")
+    
+    # Detect if run via pipe and provide guidance
+    local real_script_path
+    real_script_path=$(readlink -f "$0")
+    if [[ "$real_script_path" != /* ]] || [[ "$real_script_path" == /proc/* ]]; then
+        echo -e "${RED}错误: 无法在 'curl | bash' 模式下安装快捷命令。${NC}"
+        echo -e "${YELLOW}此功能需要先将脚本保存为文件再运行。${NC}"
+        echo -e "${YELLOW}请按照以下两步操作:${NC}"
+        echo -e "${CYAN}1. 下载脚本: curl -sSLO https://raw.githubusercontent.com/cnnlei/sh/main/gost-mwss.sh${NC}"
+        echo -e "${CYAN}2. 运行脚本: sudo bash gost-mwss.sh${NC}"
+        echo -e "${YELLOW}然后在菜单中再次选择此选项进行安装。${NC}"
+        return
+    fi
+
     local TARGET_PATH="/usr/local/bin/gost-mwss"
 
-    if [ "$SCRIPT_PATH" == "$TARGET_PATH" ]; then
+    if [ "$real_script_path" == "$TARGET_PATH" ]; then
         echo -e "${GREEN}快捷命令已经是最新的 (您正在通过它运行此脚本)。${NC}"
         return
     fi
@@ -682,7 +823,7 @@ function install_script() {
     fi
 
     echo "--> 正在复制脚本到 ${TARGET_PATH}..."
-    cp -f "$SCRIPT_PATH" "$TARGET_PATH"
+    cp -f "$real_script_path" "$TARGET_PATH"
     if [ $? -ne 0 ]; then
         echo -e "${RED}错误: 复制失败！请检查权限。${NC}"
         return
@@ -712,7 +853,7 @@ function main_menu() {
         fi
     done
 
-    local INSTALL_DEPS="curl openssl jq socat"
+    local INSTALL_DEPS="curl openssl jq socat tar"
     local DEPS_TO_INSTALL=""
     for dep in $INSTALL_DEPS; do
         if ! command -v $dep &> /dev/null; then
@@ -748,7 +889,7 @@ function main_menu() {
     while true; do
         clear
         echo "=========================================="
-        echo "      Gost-MWSS 多服务管理脚本 v1.0"
+        echo "      Gost-MWSS 多服务管理脚本 v1.7"
         echo "=========================================="
         
         local GOST_VERSION
@@ -759,7 +900,7 @@ function main_menu() {
         if [ -n "$GOST_VERSION" ]; then
             echo -e "  当前 Gost 版本: ${GREEN}${GOST_VERSION}${NC}"
         else
-            echo -e "  当前 Gost 版本: ${RED}未安装 (请使用选项 13 安装)${NC}"
+            echo -e "  当前 Gost 版本: ${RED}未安装 (请使用选项 15 安装)${NC}"
         fi
         echo "=========================================="
 
@@ -778,13 +919,16 @@ function main_menu() {
         echo "  ----------------------------------------"
         echo "  9. 查看指定服务的日志"
         echo "  10. 删除指定的 Gost-MWSS 服务"
-        echo "  11. 申请域名证书 (Let's Encrypt)"
-        echo "  12. 生成自签名证书 (OpenSSL)"
-        echo "  13. 更新 Gost 主程序 (影响所有服务)"
-        echo "  14. 安装/更新快捷命令"
-        echo "  15. 退出脚本"
+        echo "  11. 备份所有服务配置"
+        echo "  12. 从备份恢复配置"
+        echo "  ----------------------------------------"
+        echo "  13. 申请域名证书 (Let's Encrypt)"
+        echo "  14. 生成自签名证书 (OpenSSL)"
+        echo "  15. 更新 Gost 主程序"
+        echo "  16. 安装/更新快捷命令"
+        echo "  17. 退出脚本"
         echo "=========================================="
-        read -p "请输入选项 [1-15]: " choice < /dev/tty
+        read -p "请输入选项 [1-17]: " choice < /dev/tty
         case $choice in
             1) add_new_service ;;
             2) view_service_details ;;
@@ -796,11 +940,13 @@ function main_menu() {
             8) manage_autostart "disable" ;;
             9) view_logs ;;
             10) delete_service ;;
-            11) apply_certificate ;;
-            12) generate_self_signed_cert ;;
-            13) update_gost_binary ;;
-            14) install_script ;;
-            15) echo "退出脚本。"; exit 0 ;;
+            11) backup_services ;;
+            12) restore_services ;;
+            13) apply_certificate ;;
+            14) generate_self_signed_cert ;;
+            15) update_gost_binary ;;
+            16) install_script ;;
+            17) echo "退出脚本。"; exit 0 ;;
             *) echo -e "${RED}无效的选项，请重新输入。${NC}" ;;
         esac
         echo ""
