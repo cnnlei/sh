@@ -2,8 +2,8 @@
 
 # --- 脚本信息 ---
 # 名称: Gost-MWSS 多服务管理脚本
-# 版本: v1.2
-# 更新: 新增“生成自签名证书”功能 (openssl)。
+# 版本: v1.0
+# 更新: 将添加服务时的默认证书路径改回 /root/1.crt 和 /root/1.key。
 # 功能: 使用 'function' 关键字定义所有函数，以兼容ash/busybox等极简shell环境。
 # =================================================
 
@@ -193,15 +193,11 @@ function add_new_service() {
     fi
     
     echo -e "${YELLOW}--- 证书配置 ---${NC}"
-    # 智能推荐证书路径
-    local DEFAULT_CERT_PATH="/root/certs/${GOST_KNOCK_DOMAIN}/fullchain.cer"
-    local DEFAULT_KEY_PATH="/root/certs/${GOST_KNOCK_DOMAIN}/private.key"
+    read -p ">> 请输入证书(crt)文件路径 [默认: /root/1.crt]: " GOST_CERT_FILE
+    GOST_CERT_FILE=${GOST_CERT_FILE:-/root/1.crt}
 
-    read -p ">> 请输入证书(crt/cer)文件路径 [推荐: ${DEFAULT_CERT_PATH}]: " GOST_CERT_FILE
-    GOST_CERT_FILE=${GOST_CERT_FILE:-$DEFAULT_CERT_PATH}
-
-    read -p ">> 请输入密钥(key)文件路径 [推荐: ${DEFAULT_KEY_PATH}]: " GOST_KEY_FILE
-    GOST_KEY_FILE=${GOST_KEY_FILE:-$DEFAULT_KEY_PATH}
+    read -p ">> 请输入密钥(key)文件路径 [默认: /root/1.key]: " GOST_KEY_FILE
+    GOST_KEY_FILE=${GOST_KEY_FILE:-/root/1.key}
 
     if [ ! -f "$GOST_CERT_FILE" ] || [ ! -f "$GOST_KEY_FILE" ]; then
         echo -e "${YELLOW}警告: 证书文件 ${GOST_CERT_FILE} 或密钥文件 ${GOST_KEY_FILE} 不存在。${NC}"
@@ -633,7 +629,6 @@ function apply_certificate() {
     echo -e "${YELLOW}acme.sh 会自动为您处理证书的续签，无需担心过期问题。${NC}"
 }
 
-# --- NEW FUNCTION: Generate self-signed certificates ---
 function generate_self_signed_cert() {
     echo -e "${CYAN}--- 生成自签名 SSL 证书 (OpenSSL) ---${NC}"
 
@@ -744,7 +739,7 @@ function main_menu() {
     while true; do
         clear
         echo "=========================================="
-        echo "      Gost-MWSS 多服务管理脚本 v1.2"
+        echo "      Gost-MWSS 多服务管理脚本 v1.0"
         echo "=========================================="
         
         local GOST_VERSION
