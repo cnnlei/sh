@@ -2,11 +2,12 @@
 
 # --- 脚本信息 ---
 # 名称: Gost-Generic 多服务管理脚本
-# 版本: v3.2 (自定义备份目录)
+# 版本: v3.3 (增加使用示例)
 # 更新: 采用更强力的双重过滤逻辑，确保在任何情况下都能准确排除不应管理的服务。
 #       增加了对所有服务配置的备份和恢复功能。
 #       修正了恢复配置后服务未被设置为开机自启的问题。
 #       增加了自定义备份与恢复目录的功能。
+#       在添加和修改服务时，显示来自官方文档 (gost.run) 的常用示例。
 # =================================================
 
 # --- 颜色定义 ---
@@ -29,6 +30,31 @@ function check_root() {
         echo -e "${RED}错误: 此脚本必须以 root 用户权限运行。${NC}"; exit 1
     fi
 }
+
+# --- [新功能] 显示Gost使用方法 ---
+function display_gost_usage_examples() {
+    local type=$1
+    echo -e "${CYAN}--- 常用Gost配置示例 (参考: https://gost.run) ---${NC}"
+    if [[ "$type" == "L" || "$type" == "all" ]]; then
+        echo -e "${YELLOW}# 监听 (-L) 示例:${NC}"
+        echo -e "  - ${GREEN}SOCKS5 代理 (无认证):${NC} socks5://:1080"
+        echo -e "  - ${GREEN}SOCKS5 代理 (用户认证):${NC} socks5://user:pass@:1080"
+        echo -e "  - ${GREEN}HTTP 代理:${NC} http://:8080"
+        echo -e "  - ${GREEN}Shadowsocks (ss):${NC} ss://aes-256-gcm:password@:8338"
+        echo -e "  - ${GREEN}本地TCP端口转发 (本机1234端口 -> 目标8080端口):${NC} forward+tcp://:1234/127.0.0.1:8080"
+        echo -e "  - ${GREEN}TLS 隧道 (例如 wss):${NC} ws://:443?path=/ws&cert=/path/to/cert.pem&key=/path/to/key.pem"
+        echo -e "  - ${GREEN}SNI 代理:${NC} sni://:443?host=example.com&cert=/path/to/cert.pem&key=/path/to/key.pem"
+    fi
+    if [[ "$type" == "F" || "$type" == "all" ]]; then
+        echo -e "${YELLOW}# 转发 (-F) 示例 (用于构建转发链):${NC}"
+        echo -e "  - ${GREEN}通过 SOCKS5 节点转发:${NC} socks5://1.2.3.4:1080"
+        echo -e "  - ${GREEN}通过 HTTP 节点转发:${NC} http://user:pass@1.2.3.4:8080"
+        echo -e "  - ${GREEN}通过 Shadowsocks 节点转发:${NC} ss://aes-128-cfb:password@1.2.3.4:8338"
+        echo -e "  - ${GREEN}通过 TLS 隧道转发:${NC} wss://example.com/ws"
+    fi
+    echo "---------------------------------------------------------"
+}
+
 
 function list_services_for_menu() {
     echo -e "${CYAN}--- 当前已配置的 Gost 服务 ---${NC}"
@@ -160,6 +186,9 @@ function add_new_service() {
     echo ""
     echo -e "${YELLOW}--- 配置 Gost 监听 (-L) ---${NC}"
     echo "您现在将逐一添加监听配置。"
+    
+    display_gost_usage_examples "L"
+
     while true; do
         read -p ">> 请输入一个监听配置 (例如: socks5://:1080), 或直接回车完成添加: " listen_conf < /dev/tty
         if [ -z "$listen_conf" ]; then
@@ -181,6 +210,9 @@ function add_new_service() {
     echo ""
     echo -e "${YELLOW}--- 配置 Gost 转发 (-F) (可选) ---${NC}"
     echo "如果需要，您现在可以逐一添加后置转发代理，构建转发链。"
+    
+    display_gost_usage_examples "F"
+
     while true; do
         read -p ">> 请输入一个转发配置 (例如: socks5://1.2.3.4:1080), 或直接回车跳过: " forward_conf < /dev/tty
         if [ -z "$forward_conf" ]; then
@@ -278,11 +310,11 @@ function modify_service() {
 
         case $listen_choice in
             a|A)
-                read -p ">> 请输入要添加到末尾的监听配置: " new_listen
+                display_gost_usage_examples "L"; read -p ">> 请输入要添加到末尾的监听配置: " new_listen
                 if [ -n "$new_listen" ]; then current_listens+=("$new_listen"); echo -e "${GREEN}添加成功！${NC}"; else echo -e "${RED}输入为空，未添加。${NC}"; fi; sleep 1;;
             i|I)
                 if [ ${#current_listens[@]} -eq 0 ]; then echo -e "${YELLOW}列表为空，请使用 [A]dd 添加第一项。${NC}"; sleep 2; continue; fi
-                read -p ">> 请输入要插入的新监听配置: " new_listen
+                display_gost_usage_examples "L"; read -p ">> 请输入要插入的新监听配置: " new_listen
                 if [ -z "$new_listen" ]; then echo -e "${RED}输入为空，操作取消。${NC}"; sleep 1; continue; fi
                 read -p ">> 请输入要参照的序号 [1-${#current_listens[@]}]: " index
                 if ! [[ "$index" =~ ^[0-9]+$ ]] || [ "$index" -lt 1 ] || [ "$index" -gt ${#current_listens[@]} ]; then echo -e "${RED}无效的序号。${NC}"; sleep 1; continue; fi
@@ -305,7 +337,7 @@ function modify_service() {
                 if [[ "$mod_index" =~ ^[0-9]+$ ]] && [ "$mod_index" -ge 1 ] && [ "$mod_index" -le ${#current_listens[@]} ]; then
                     local real_index=$((mod_index - 1))
                     echo -e "当前值: ${YELLOW}${current_listens[$real_index]}${NC}"
-                    read -p ">> 请输入新的配置内容: " new_value
+                    display_gost_usage_examples "L"; read -p ">> 请输入新的配置内容: " new_value
                     if [ -n "$new_value" ]; then current_listens[$real_index]="$new_value"; echo -e "${GREEN}修改成功！${NC}"; else echo -e "${RED}输入为空，未修改。${NC}"; fi
                 else
                     echo -e "${RED}无效的序号。${NC}"
@@ -364,11 +396,11 @@ function modify_service() {
 
         case $forward_choice in
             a|A)
-                read -p ">> 请输入要添加到末尾的转发配置: " new_forward
+                display_gost_usage_examples "F"; read -p ">> 请输入要添加到末尾的转发配置: " new_forward
                 if [ -n "$new_forward" ]; then current_forwards+=("$new_forward"); echo -e "${GREEN}添加成功！${NC}"; else echo -e "${RED}输入为空，未添加。${NC}"; fi; sleep 1;;
             i|I)
                 if [ ${#current_forwards[@]} -eq 0 ]; then echo -e "${YELLOW}列表为空，请使用 [A]dd 添加第一项。${NC}"; sleep 2; continue; fi
-                read -p ">> 请输入要插入的新转发配置: " new_forward
+                display_gost_usage_examples "F"; read -p ">> 请输入要插入的新转发配置: " new_forward
                 if [ -z "$new_forward" ]; then echo -e "${RED}输入为空，操作取消。${NC}"; sleep 1; continue; fi
                 read -p ">> 请输入要参照的序号 [1-${#current_forwards[@]}]: " index
                 if ! [[ "$index" =~ ^[0-9]+$ ]] || [ "$index" -lt 1 ] || [ "$index" -gt ${#current_forwards[@]} ]; then echo -e "${RED}无效的序号。${NC}"; sleep 1; continue; fi
@@ -391,7 +423,7 @@ function modify_service() {
                 if [[ "$mod_index" =~ ^[0-9]+$ ]] && [ "$mod_index" -ge 1 ] && [ "$mod_index" -le ${#current_forwards[@]} ]; then
                     local real_index=$((mod_index - 1))
                     echo -e "当前值: ${YELLOW}${current_forwards[$real_index]}${NC}"
-                    read -p ">> 请输入新的配置内容: " new_value
+                    display_gost_usage_examples "F"; read -p ">> 请输入新的配置内容: " new_value
                     if [ -n "$new_value" ]; then current_forwards[$real_index]="$new_value"; echo -e "${GREEN}修改成功！${NC}"; else echo -e "${RED}输入为空，未修改。${NC}"; fi
                 else
                     echo -e "${RED}无效的序号。${NC}";
@@ -965,7 +997,7 @@ function main_menu() {
     while true; do
         clear
         echo "=========================================="
-        echo "      Gost-Generic 多服务管理脚本 v3.2"
+        echo "      Gost-Generic 多服务管理脚本 v3.3"
         echo "=========================================="
         
         local GOST_VERSION
