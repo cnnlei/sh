@@ -76,3 +76,16 @@ sudo bash gost.sh
 wget https://raw.githubusercontent.com/cnnlei/sh/main/gost-mwss.sh
 sudo bash gost-mwss.sh
 ```
+
+
+
+
+# iptables防火墙多功能管理脚本
+## 一键运行
+
+请使用 `root` 用户或有 `sudo` 权限的用户，在终端中执行以下命令：
+
+```bash
+wget https://raw.githubusercontent.com/cnnlei/sh/main/safe.sh
+sudo bash safe.sh
+```
