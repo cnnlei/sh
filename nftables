@@ -5,7 +5,8 @@
 #   文件: firewall.sh
 #   描述: Nftables 防火墙可视化管理脚本 (最终修复版)
 #   作者: Gemini & 您
-#   版本: 24.09.7 (Fix: 增强SSH防御策略切换的兼容性, 解决懒加载问题)
+#   版本: 24.09.10 (Fix: 修正IP集选择列表, 默认排除专用的SSH白名单)
+#   f2b参数修改出错  f2b白名单 删除多选 全删除  策略数据修改修复  有些添加删除策略刷新网络
 #
 #================================================================
 
@@ -63,8 +64,8 @@ install_dependencies() {
         dnf|yum)
             CMD_TO_PKG_MAP=(
                 [nft]="nftables" [conntrack]="conntrack-tools" [curl]="curl"
-                [split]="coreutils" [awk]="gawk" [ip]="iproute2"
-                [ss]="iproute2" [pgrep]="procps-ng" [systemctl]="systemd"
+                [split]="coreutils" [awk]="gawk" [ip]="iproute"
+                [ss]="iproute" [pgrep]="procps-ng" [systemctl]="systemd"
                 [bmon]="bmon" [nethogs]="nethogs" [iftop]="iftop" [socat]="socat"
                 [realpath]="coreutils"
             )
@@ -208,7 +209,7 @@ flush_conntrack() {
         conntrack -D ${port_cmd_part}
         count=0
     fi
-    if [ $? -eq 0 ]; then echo -e "${GREEN}    连接清理完成。${NC}"; else echo -e "${RED}    连接清理失败!${NC}"; fi
+    if [ $? -eq 0 ]; then echo -e "${GREEN}  连接清理完成。${NC}"; else echo -e "${RED}  连接清理失败!${NC}"; fi
 }
 apply_and_save_changes() {
     local op_success_code=${1}; local entity=${2:-}; local pause_after=${3:-true}; local rule_type=${4:-""}; local ports_to_flush=${5:-""}
@@ -311,28 +312,27 @@ update_ip_set_from_source() { local set_to_update=$1; echo -e "\n${YELLOW}--- �
 is_set_in_use() { local set_name=$1; if nft --handle list ruleset | grep -q "@${set_name}"; then return 0; else return 1; fi; }
 delete_set_and_referencing_rules() { local set_name=$1; echo -e "${YELLOW}正在智能删除IP集 ${set_name}...${NC}"; local rules_deleted=0; local current_table=""; local current_chain=""; while IFS= read -r line; do if [[ "$line" =~ ^[[:space:]]*table[[:space:]]+inet[[:space:]]+([a-zA-Z0-9_-]+) ]]; then current_table="${BASH_REMATCH[1]}"; current_chain=""; continue; fi; if [[ "$line" =~ ^[[:space:]]*chain[[:space:]]+([a-zA-Z0-9_-]+) ]]; then current_chain="${BASH_REMATCH[1]}"; continue; fi; if [[ "$line" =~ "@${set_name}" && "$line" =~ handle[[:space:]]+([0-9]+) ]]; then local handle="${BASH_REMATCH[1]}"; if [[ -n "$current_table" && -n "$current_chain" && -n "$handle" ]]; then echo -e "${CYAN}  -> 发现引用规则 (Table: ${current_table}, Chain: ${current_chain}, Handle: ${handle}), 正在删除...${NC}"; if nft delete rule inet "$current_table" "$current_chain" handle "$handle"; then ((rules_deleted++)); else echo -e "${RED}  -> 错误: 删除引用规则失败 (Handle: ${handle})。操作中止。${NC}"; return 1; fi; fi; fi; done < <(nft --handle list ruleset); if [ $rules_deleted -gt 0 ]; then echo -e "${GREEN}  -> 已成功删除 ${rules_deleted} 条引用规则。${NC}"; fi; nft delete set inet "${TABLE_NAME}" "${set_name}"; if [ $? -eq 0 ]; then echo -e "${GREEN}  -> 已成功删除nftables set: ${set_name}。${NC}"; return 0; else echo -e "${RED}  -> 删除nftables set: ${set_name} 失败。${NC}"; return 1; fi; }
 view_delete_lists() { while true; do clear; echo -e "${BLUE}--- 浏览 / 更新 / 删除 IP 集 ---${NC}\n"; mapfile -t all_sets < <(nft list sets 2>/dev/null | awk '/set (set_country_|set_custom_)/ {print $2}' | sort); if [ ${#all_sets[@]} -eq 0 ]; then echo -e "${YELLOW}当前没有任何已创建的IP集。${NC}"; press_any_key; break; fi; echo -e "${CYAN}当前已创建的IP集:${NC}"; local i=1; for set_name in "${all_sets[@]}"; do local display_name=$(echo "$set_name" | sed -E 's/set_(country|custom)_//; s/_(v4|v6)$//'); local type=$(echo "$set_name" | awk -F_ '{print $2}'); local version=$(echo "$set_name" | awk -F_ '{print $NF}'); echo -e " ${GREEN}[$i]${NC} - 名称: ${display_name}, 类型: ${type^}, 版本: ${version^^} ${CYAN}(Set: ${set_name})${NC}"; ((i++)); done; echo -e "\n${PURPLE}------------------------[ 操作 ]------------------------${NC}"; echo -e " ${GREEN}u <编号>${NC}    - 更新指定的IP集 (例如: u 1 3)"; echo -e " ${GREEN}d <编号>${NC}    - 删除指定的IP集 (例如: d 2 4)"; echo -e " ${GREEN}ua${NC}          - ${YELLOW}更新所有${NC} IP集"; echo -e " ${GREEN}da${NC}          - ${RED}删除所有${NC} IP集"; echo -e "\n ${GREEN}q.${NC}           - 返回"; echo -e "${PURPLE}------------------------------------------------------${NC}"; read -p "请输入您的操作和编号: " action_input; if [[ $action_input =~ ^[qQ]$ ]]; then break; fi; local action=$(echo "$action_input" | awk '{print tolower($1)}'); local choices_str=$(echo "$action_input" | cut -d' ' -f2-); if [[ "$action" == "ua" || "$action" == "updateall" ]]; then echo -e "\n${YELLOW}准备更新所有 ${#all_sets[@]} 个IP集...${NC}"; local all_indices=(); for ((j=0; j<${#all_sets[@]}; j++)); do all_indices+=($((j+1))); done; choices_str="${all_indices[*]}"; action="u"; elif [[ "$action" == "da" || "$action" == "deleteall" ]]; then echo -ne "${RED}警告: 您确定要删除所有 ${#all_sets[@]} 个IP集和它们的源文件吗? (y/N): ${NC}"; read confirm; if [[ ! "$confirm" =~ ^[yY]$ ]]; then echo -e "\n${YELLOW}操作已取消。${NC}"; sleep 1; continue; fi; echo -e "\n${RED}准备删除所有 ${#all_sets[@]} 个IP集...${NC}"; local all_indices=(); for ((j=0; j<${#all_sets[@]}; j++)); do all_indices+=($((j+1))); done; choices_str="${all_indices[*]}"; action="d"; fi; read -ra choices <<< "$choices_str"; if [ ${#choices[@]} -eq 0 ]; then continue; fi; local sorted_choices=($(for i in "${choices[@]}"; do echo "$i"; done | sort -nur)); local operation_failed=false; case "$action" in u|update) echo -e "\n${YELLOW}准备更新IP集 (编号: ${sorted_choices[*]})...${NC}"; for choice in "${sorted_choices[@]}"; do local index=$((choice-1)); if [[ "$choice" -ge 1 && "$choice" -le ${#all_sets[@]} ]]; then local set_to_update="${all_sets[$index]}"; update_ip_set_from_source "$set_to_update"; if [ $? -ne 0 ]; then operation_failed=true; fi; else echo -e "${RED}无效编号: $choice${NC}"; fi; done; if $operation_failed; then apply_and_save_changes 1 "IP集更新操作" true; else apply_and_save_changes 0 "IP集更新操作" true; fi; ;; d|delete) echo -e "\n${YELLOW}准备删除IP集 (编号: ${sorted_choices[*]})...${NC}"; local sets_to_delete_names=(); for choice in "${sorted_choices[@]}"; do local index=$((choice-1)); if [[ "$choice" -ge 1 && "$choice" -le ${#all_sets[@]} ]]; then sets_to_delete_names+=("${all_sets[$index]}"); fi; done; for set_to_delete in "${sets_to_delete_names[@]}"; do local proceed_with_delete=false; if is_set_in_use "$set_to_delete"; then echo -ne "${RED}警告: IP集 '${set_to_delete}' 正在被规则使用。删除它将同时删除相关规则。您确定吗? (y/N): ${NC}"; read -r confirm_delete; if [[ "$confirm_delete" =~ ^[yY]$ ]]; then echo -e "${YELLOW}用户已确认, 继续删除...${NC}"; proceed_with_delete=true; else echo -e "${YELLOW}操作已取消: IP集 '${set_to_delete}' 未被删除。${NC}"; fi; else echo -e "${CYAN}IP集 '${set_to_delete}' 未被使用, 将直接删除...${NC}"; proceed_with_delete=true; fi; if ! $proceed_with_delete; then continue; fi; delete_set_and_referencing_rules "$set_to_delete"; if [ $? -eq 0 ]; then local basename=$(echo "$set_to_delete" | sed -E 's/_(v4|v6)$//'); local counterpart_v4="${basename}_v4"; local counterpart_v6="${basename}_v6"; local other_set_exists=false; if nft list set inet ${TABLE_NAME} ${counterpart_v4} &>/dev/null; then other_set_exists=true; fi; if nft list set inet ${TABLE_NAME} ${counterpart_v6} &>/dev/null; then other_set_exists=true; fi; if ! $other_set_exists; then echo -e "${CYAN}  -> 未发现此IP集的其他版本 (v4/v6)，将尝试删除源文件。${NC}"; local type=$(echo "$set_to_delete" | awk -F_ '{print $2}'); local name=$(echo "$basename" | sed "s/set_${type}_//"); local file_to_delete=""; if [[ "$type" == "country" ]]; then file_to_delete="${COUNTRY_IP_DIR}/${name}.txt"; else file_to_delete="${CUSTOM_IP_DIR}/${name}.txt"; fi; if [ -f "$file_to_delete" ]; then rm -f "$file_to_delete"; echo -e "${GREEN}  -> 已删除源文件: ${file_to_delete}${NC}"; fi; fi; else operation_failed=true; fi; done; if $operation_failed; then apply_and_save_changes 1 "删除IP集操作" true; else apply_and_save_changes 0 "删除IP集操作" true; fi; ;; *) echo -e "${RED}无效操作。请输入 'u', 'd', 'ua', 'da', 或 'q'。${NC}"; sleep 2; ;; esac; done; }
-ipset_manager_menu() { while true; do clear; echo -e "${PURPLE}======================================================${NC}"; echo -e "                                      ${CYAN}IP 集管理中心${NC}"; echo -e "${PURPLE}======================================================${NC}"; echo -e " ${GREEN}1.${NC} 下载国家IP列表 (GeoIP)"; echo -e " ${GREEN}2.${NC} 下载自定义IP列表"; echo -e " ${GREEN}3.${NC} 浏览/更新/删除 IP 集"; echo -e "\n ${GREEN}q.${NC} 返回主菜单"; echo -e "${PURPLE}------------------------------------------------------${NC}"; read -p "请输入您的选项: " choice; case $choice in 1) download_country_list ;; 2) download_custom_list ;; 3) view_delete_lists ;; q|Q) break ;; *) echo -e "\n${RED}无效选项。${NC}"; sleep 1 ;; esac; done; }
+ipset_manager_menu() { while true; do clear; echo -e "${PURPLE}======================================================${NC}"; echo -e "                                  ${CYAN}IP 集管理中心${NC}"; echo -e "${PURPLE}======================================================${NC}"; echo -e " ${GREEN}1.${NC} 下载国家IP列表 (GeoIP)"; echo -e " ${GREEN}2.${NC} 下载自定义IP列表"; echo -e " ${GREEN}3.${NC} 浏览/更新/删除 IP 集"; echo -e "\n ${GREEN}q.${NC} 返回主菜单"; echo -e "${PURPLE}------------------------------------------------------${NC}"; read -p "请输入您的选项: " choice; case $choice in 1) download_country_list ;; 2) download_custom_list ;; 3) view_delete_lists ;; q|Q) break ;; *) echo -e "\n${RED}无效选项。${NC}"; sleep 1 ;; esac; done; }
 
 # --- 交互式选择函数 ---
 select_from_ipset() {
-    local mode=${1:-"default"} # 接收一个可选参数, 如 'exclude_f2b'
+    local mode=${1:-"default"} # 可选参数: 'include_all'
     
-    # 基础命令, 用于获取所有相关的set
+    # 基础命令, 获取所有用户可操作的 set
     local base_cmd="nft list sets 2>/dev/null | awk '/set (set_country_|set_custom_|F2B_SSH_WHITELIST_)/ {print \$2}'"
 
-    # 根据模式决定是否过滤
-    if [[ "$mode" == "exclude_f2b" ]]; then
-        mapfile -t sets < <(eval "$base_cmd" | grep -v '^F2B_SSH_WHITELIST_' | sort)
-    else
+    # 默认情况下，我们排除专用的SSH白名单，因为它们通常是“目标”而不是“来源”
+    if [[ "$mode" == "include_all" ]]; then
+        # 仅在极少数需要时才包含所有 set
         mapfile -t sets < <(eval "$base_cmd" | sort)
+    else
+        # 默认行为：过滤掉 F2B_SSH_WHITELIST_*
+        mapfile -t sets < <(eval "$base_cmd" | grep -v '^F2B_SSH_WHITELIST_')
     fi
 
     if [ ${#sets[@]} -eq 0 ]; then
-        if [[ "$mode" == "exclude_f2b" ]]; then
-             echo -e "\n${YELLOW}当前没有任何可用于封禁/解封的IP集 (已排除SSH白名单)。${NC}" >&2
-        else
-             echo -e "\n${YELLOW}当前没有任何IP集可供选择。请先通过 [IP 集管理] 下载。${NC}" >&2
-        fi
+        echo -e "\n${YELLOW}当前没有任何可用的IP集 (已排除SSH白名单)。${NC}" >&2
+        echo -e "${YELLOW}请先通过 [IP 集管理] 下载。${NC}" >&2
         return 1
     fi
     
@@ -343,6 +343,7 @@ select_from_ipset() {
             local ip_ver="IPv4"
             if [[ "$s" == *_v6 ]] || [[ "$s" == *_V6 ]]; then ip_ver="IPv6"; fi
             local purpose=""
+            # 此处的显示逻辑依然保留，以防万一在 include_all 模式下被调用
             if [[ "$s" == F2B_SSH* ]]; then purpose="${PURPLE}[SSH白名单专用]${NC} "; fi
             echo -e " ${GREEN}$i)${NC} ${purpose}$s ${YELLOW}[${ip_ver}]${NC}" >&2
             ((i++))
@@ -362,7 +363,213 @@ select_host_target() { local ip_type=${1:-""}; local direction=$2; local target_
 # --- 规则添加/删除功能 ---
 add_rule_ip_based() { local direction=$1; local action=$2; local title=$3; local target_chain=""; local rule_ip_prop; local ip_input=""; local is_set=false; local final_status=0; local ip_type=""; if [[ "$direction" == "in" ]]; then if [[ "$action" == "accept" ]]; then target_chain="${USER_IP_WHITELIST}"; else target_chain="${USER_IP_BLACKLIST}"; fi; rule_ip_prop="saddr"; elif [[ "$direction" == "out" ]]; then target_chain="${USER_OUT_IP_BLOCK}"; action="drop"; rule_ip_prop="daddr"; else echo -e "${RED}错误: 无效的规则方向。${NC}"; press_any_key; return; fi; clear; echo -e "${BLUE}--- ${title} ---${NC}\n"; echo -e "${CYAN}请选择操作对象:${NC}"; echo " 1) 手动输入IP/网段 (默认)"; echo " 2) 从已有的IP集中选择"; local choice_obj; read -p "#? (默认: 1): " choice_obj; choice_obj=${choice_obj:-1}; local prompt=""; if [[ "$direction" == "in" ]]; then prompt="请输入源IP地址或网段 ('q'返回): "; else prompt="请输入目标IP地址或网段 ('q'返回): "; fi; if [[ "$choice_obj" == "2" ]]; then ip_input=$(select_from_ipset); if [ $? -ne 0 ]; then echo -e "\n${YELLOW}操作已取消。${NC}"; sleep 1; return; fi; is_set=true; if [[ "$ip_input" == *_v6 ]] || [[ "$ip_input" == *_V6 ]]; then ip_type="ipv6"; else ip_type="ipv4"; fi; else while true; do read -p "$prompt" ip_input; if [[ $ip_input =~ ^[qQ]$ ]]; then echo -e "\n${YELLOW}操作已取消。${NC}"; sleep 1; return; fi; ip_type=$(validate_ip_or_cidr "$ip_input"); if [[ "$ip_type" != "invalid" ]]; then break; else echo -e "${RED}IP地址格式错误。${NC}"; fi; done; fi; while true; do echo -e "\n${CYAN}请选择协议:${NC}"; echo -e " 1) 所有协议 (默认)"; echo -e " 2) TCP"; echo -e " 3) UDP"; echo -e " 4) ICMP"; echo -e " 5) ICMPv6"; echo -e " 6) 手动输入"; echo -e " q) 返回"; read -p "#? (默认: 1): " choice; choice=${choice:-1}; case $choice in 1) protocol=""; break;; 2) protocol="tcp"; break;; 3) protocol="udp"; break;; 4) protocol="icmp"; break;; 5) protocol="icmpv6"; break;; 6) read -p "协议名: " protocol; break;; [qQ]) echo -e "\n${YELLOW}操作已取消。${NC}"; sleep 1; return ;; *) echo -e "${RED}无效选择, 请重新输入。${NC}";; esac; done; local port_input=""; local formatted_ports=""; if [[ -n "$protocol" && "$protocol" != "icmp" && "$protocol" != "icmpv6" ]]; then while true; do echo -e "\n${CYAN}支持格式 - 单个:80, 多个:80,443, 范围:1000-2000${NC}"; read -p "请输入端口('q'返回,留空为所有): " port_input; if [[ $port_input =~ ^[qQ]$ ]]; then echo -e "\n${YELLOW}操作已取消。${NC}"; sleep 1; return; fi; formatted_ports=$(validate_and_format_ports "$port_input"); if [ $? -eq 0 ]; then break; else echo -e "${RED}${formatted_ports}${NC}"; fi; done; fi; local target_info; target_info=$(select_host_target "$ip_type" "$direction"); if [ $? -ne 0 ] || [[ -z "$target_info" ]]; then echo -e "\n${YELLOW}操作已取消。${NC}"; sleep 1; return; fi; local target_type=$(echo "$target_info" | cut -d: -f1); local target_value=$(echo "$target_info" | cut -d: -f2-); read -p "请输入备注 (可选, 'q'取消): " comment; if [[ $comment =~ ^[qQ]$ ]]; then echo -e "\n${YELLOW}操作已取消。${NC}"; sleep 1; return; fi; local base_cmd=("nft" "insert" "rule" "inet" "${TABLE_NAME}" "${target_chain}"); local entity_desc="${title} ${ip_input}"; if [[ -n "$target_value" ]]; then entity_desc+=" -> ${target_type}:\"${target_value}\""; fi; if [[ -n "$protocol" ]]; then entity_desc+=" [协议:${protocol}]"; fi; if [[ -n "$port_input" ]]; then entity_desc+=" [端口:${port_input}]"; fi; local cmd_args=("${base_cmd[@]}"); local ip_prefix="ip"; if [[ "$ip_type" == "ipv6" ]]; then ip_prefix="ip6"; fi; if [[ -n "$target_value" ]]; then cmd_args+=("$ip_prefix" "$target_type" "\"$target_value\""); fi; if $is_set; then cmd_args+=("$ip_prefix" "$rule_ip_prop" "@$ip_input"); else cmd_args+=("$ip_prefix" "$rule_ip_prop" "$ip_input"); fi; if [[ -n "$protocol" ]]; then if [[ -n "$formatted_ports" ]]; then cmd_args+=("$protocol" "dport" "$formatted_ports"); else cmd_args+=("meta" "l4proto" "$protocol"); fi; fi; local rule_comment="${comment:-Rule_for_${ip_input}}"; cmd_args+=("$action" "comment" "\"$rule_comment\""); echo -e "${YELLOW}执行: ${cmd_args[*]}${NC}"; "${cmd_args[@]}"; final_status=$?; apply_and_save_changes $final_status "$entity_desc" "true" "$action" "$port_input"; }
 add_rule_port_based() { local direction=$1; local action=$2; local title=$3; local target_chain=""; local final_status=0; local ip_input="" ip_type="" is_set=false; if [[ "$direction" == "in" ]]; then if [[ "$action" == "accept" ]]; then target_chain="${USER_PORT_ALLOW}"; else target_chain="${USER_PORT_BLOCK}"; fi; elif [[ "$direction" == "out" ]]; then target_chain="${USER_OUT_PORT_BLOCK}"; action="drop"; else echo -e "${RED}错误: 无效的规则方向。${NC}"; press_any_key; return; fi; clear; echo -e "${BLUE}--- ${title} ---${NC}\n"; while true; do echo -e "${CYAN}支持格式 - 单个:80, 多个:80,443, 范围:1000-2000${NC}"; read -p "请输入要操作的端口 (输入 'q' 返回): " port_input; if [[ $port_input =~ ^[qQ]$ ]]; then echo -e "\n${YELLOW}操作已取消。${NC}"; sleep 1; return; fi; formatted_ports=$(validate_and_format_ports "$port_input"); if [[ $? -eq 0 && -n "$formatted_ports" ]]; then break; else echo -e "${RED}输入无效或为空。${NC}"; fi; done; local ip_prop_text; [[ "$direction" == "in" ]] && ip_prop_text="来源" || ip_prop_text="目标"; echo -e "\n${CYAN}请选择此规则的IP${ip_prop_text}:${NC}"; echo " 1) 所有IP (默认)"; echo " 2) 指定单个IP/网段"; echo " 3) 从已有的IP集中选择"; local choice_ip_source; read -p "#? (默认: 1): " choice_ip_source; choice_ip_source=${choice_ip_source:-1}; case $choice_ip_source in 2) local prompt="请输入${ip_prop_text}IP地址或网段 ('q'返回): "; while true; do read -p "$prompt" ip_input; if [[ $ip_input =~ ^[qQ]$ ]]; then echo -e "\n${YELLOW}操作已取消。${NC}"; sleep 1; return; fi; ip_type=$(validate_ip_or_cidr "$ip_input"); if [[ "$ip_type" != "invalid" ]]; then break; else echo -e "${RED}IP地址格式错误。${NC}"; fi; done ;; 3) ip_input=$(select_from_ipset); if [ $? -ne 0 ]; then echo -e "\n${YELLOW}操作已取消。${NC}"; sleep 1; return; fi; is_set=true; if [[ "$ip_input" == *_v6 ]] || [[ "$ip_input" == *_V6 ]]; then ip_type="ipv6"; else ip_type="ipv4"; fi ;; *) ip_input="" ;; esac; local target_info; target_info=$(select_host_target "$ip_type" "$direction"); if [ $? -ne 0 ] || [[ -z "$target_info" ]]; then echo -e "\n${YELLOW}操作已取消。${NC}"; sleep 1; return; fi; local target_type=$(echo "$target_info" | cut -d: -f1); local target_value=$(echo "$target_info" | cut -d: -f2-); while true; do echo -e "\n${CYAN}请选择协议:${NC}"; echo -e " 1) All (TCP+UDP) (默认)"; echo -e " 2) TCP"; echo -e " 3) UDP"; echo -e " q) 返回"; read -p "#? (默认: 1. All): " choice; choice=${choice:-1}; case $choice in 1) protocols_to_add=("tcp" "udp"); protocol_desc="TCP+UDP"; break;; 2) protocols_to_add=("tcp"); protocol_desc="TCP"; break;; 3) protocols_to_add=("udp"); protocol_desc="UDP"; break;; [qQ]) echo -e "\n${YELLOW}操作已取消。${NC}"; sleep 1; return;; *) echo -e "${RED}无效选择。${NC}";; esac; done; read -p "请输入备注 (可选, 'q'取消): " comment; if [[ $comment =~ ^[qQ]$ ]]; then echo -e "\n${YELLOW}操作已取消。${NC}"; sleep 1; return; fi; local command_verb; if [[ "$action" == "accept" ]]; then command_verb="add"; else command_verb="insert"; fi; local entity_desc="${title} 端口:${port_input}"; if [[ -n "$ip_input" ]]; then entity_desc+=" (IP ${ip_prop_text}:${ip_input})"; fi; if [[ -n "$target_value" ]]; then entity_desc+=" -> ${target_type}:\"${target_value}\""; fi; entity_desc+=" [协议: ${protocol_desc}]"; for proto in "${protocols_to_add[@]}"; do local full_comment="${comment:-${action^}_Port_$(echo "$port_input" | sed 's/,/_/g')}_${proto}}"; local base_cmd_args=("nft" "${command_verb}" "rule" "inet" "${TABLE_NAME}" "${target_chain}"); if [[ -n "$target_value" ]]; then local host_ip_version=$(validate_ip_or_cidr "$target_value"); if [[ "$host_ip_version" == "ipv6" ]]; then base_cmd_args+=("ip6"); elif [[ "$host_ip_version" == "ipv4" ]]; then base_cmd_args+=("ip"); fi; base_cmd_args+=("$target_type" "\"$target_value\""); fi; if [[ -n "$ip_input" ]]; then local ip_prop; [[ "$direction" == "in" ]] && ip_prop="saddr" || ip_prop="daddr"; local ip_prefix; [[ "$ip_type" == "ipv6" ]] && ip_prefix="ip6" || ip_prefix="ip"; base_cmd_args+=("$ip_prefix" "$ip_prop"); if $is_set; then base_cmd_args+=("@$ip_input"); else base_cmd_args+=("$ip_input"); fi; fi; base_cmd_args+=("$proto" "dport" "$formatted_ports" "$action" "comment" "\"$full_comment\""); echo -e "${YELLOW}执行命令: ${base_cmd_args[*]}${NC}"; "${base_cmd_args[@]}"; if [ $? -ne 0 ]; then final_status=1; fi; done; local type_arg="add_block"; if [[ "$action" == "accept" ]]; then type_arg="add_allow"; fi; apply_and_save_changes $final_status "$entity_desc" "true" "$type_arg" "$port_input"; }
-delete_rule_visual() { local user_chains=("${USER_IP_WHITELIST}" "${USER_IP_BLACKLIST}" "${USER_PORT_BLOCK}" "${USER_PORT_ALLOW}" "${USER_OUT_IP_BLOCK}" "${USER_OUT_PORT_BLOCK}"); while true; do clear; echo -e "${BLUE}--- 删除用户自定义规则 (增强模式) ---${NC}\n"; local i=1; local all_rules_text=(); local all_rules_handle=(); local all_rules_chain=(); local all_rules_action=(); local all_rules_ports=(); echo -e "${CYAN}当前可删除的所有用户规则 (已按优先级排序):${NC}"; for chain_name in "${user_chains[@]}"; do mapfile -t rules < <(nft --handle list chain inet ${TABLE_NAME} "${chain_name}"); for rule in "${rules[@]}"; do if ! [[ "$rule" =~ ^[[:space:]]*chain ]]; then local handle=$(echo "$rule" | awk '/handle/ {print $NF}'); if [[ -n "$handle" ]]; then echo -e "${GREEN}[$i]${NC} - ${CYAN}(来自 ${chain_name})${NC} $rule"; local action=$(echo "$rule" | awk '{ for(i=1; i<=NF; i++) { if ($i == "accept" || $i == "drop") { print $i; break; } } }'); local ports=$(echo "$rule" | grep -o 'dport {.*}' | sed 's/dport //'); all_rules_text+=("$rule"); all_rules_handle+=("$handle"); all_rules_chain+=("$chain_name"); all_rules_action+=("$action"); all_rules_ports+=("$ports"); ((i++)); fi; fi; done; done; if [ ${#all_rules_handle[@]} -eq 0 ]; then echo -e "\n${YELLOW}没有用户添加的规则可供删除。${NC}"; press_any_key; break; fi; echo -e "\n${CYAN}提示: 可输入单个(5), 多个(2 4 6), 'a'(全部), 或 'q'(返回).${NC}"; read -p "请输入要删除的规则编号: " choice_input; if [[ $choice_input =~ ^[qQ]$ ]]; then break; fi; if [[ $choice_input =~ ^[aA](ll)?$ ]]; then read -p "警告: 您确定要删除所有 ${#all_rules_handle[@]} 条用户规则吗? (y/N): " confirm; if [[ "$confirm" =~ ^[yY]$ ]]; then for chain_name in "${user_chains[@]}"; do nft flush chain inet "${TABLE_NAME}" "$chain_name"; done; apply_and_save_changes 0 "删除所有用户规则" false; echo -e "${GREEN}所有规则已删除, 正在刷新...${NC}"; sleep 1; else echo -e "\n${YELLOW}操作已取消。${NC}"; sleep 1; fi; continue; fi; local sanitized_input=$(echo "$choice_input" | tr ',' ' '); read -ra choices <<< "$sanitized_input"; if [ ${#choices[@]} -eq 0 ]; then echo -e "\n${RED}输入为空。${NC}"; sleep 1; continue; fi; local valid_choices=true; for choice in "${choices[@]}"; do if ! [[ "$choice" =~ ^[0-9]+$ && "$choice" -ge 1 && "$choice" -le ${#all_rules_handle[@]} ]]; then echo -e "\n${RED}输入错误: '$choice' 不是一个有效的编号。${NC}"; sleep 2; valid_choices=false; break; fi; done; if ! $valid_choices; then continue; fi; local sorted_choices=($(for i in "${choices[@]}"; do echo "$i"; done | sort -nur)); echo -e "${YELLOW}准备删除规则编号: ${sorted_choices[*]}...${NC}"; local final_success=0; local deleted_count=0; local ports_to_flush=(); for choice in "${sorted_choices[@]}"; do local index=$((choice-1)); local handle_to_delete=${all_rules_handle[$index]}; local chain_to_delete_from=${all_rules_chain[$index]}; local action_of_rule=${all_rules_action[$index]}; local ports_of_rule=${all_rules_ports[$index]}; nft delete rule inet "${TABLE_NAME}" "${chain_to_delete_from}" handle "${handle_to_delete}"; if [ $? -eq 0 ]; then ((deleted_count++)); if [[ "$action_of_rule" == "drop" ]]; then ports_to_flush+=("$ports_of_rule"); fi; else final_success=1; fi; done; apply_and_save_changes $final_success "删除 ${deleted_count} 条规则" false "del_block" "${ports_to_flush[@]}"; echo -e "${GREEN}操作完成, 正在刷新列表...${NC}"; sleep 1; done; echo -e "\n${YELLOW}已退出删除模式。${NC}"; sleep 1; }
+edit_delete_rule_visual() {
+    local user_chains=("${USER_IP_WHITELIST}" "${USER_IP_BLACKLIST}" "${USER_PORT_BLOCK}" "${USER_PORT_ALLOW}" "${USER_OUT_IP_BLOCK}" "${USER_OUT_PORT_BLOCK}")
+
+    while true; do
+        clear
+        echo -e "${BLUE}--- 编辑/删除 用户自定义规则 (增强模式) ---${NC}\n"
+        local i=1
+        local all_rules_text=()
+        local all_rules_handle=()
+        local all_rules_chain=()
+        local all_rules_action=()
+        local all_rules_ports=()
+
+        echo -e "${CYAN}当前可操作的所有用户规则 (已按优先级排序):${NC}"
+        for chain_name in "${user_chains[@]}"; do
+            mapfile -t rules < <(nft --handle list chain inet ${TABLE_NAME} "${chain_name}")
+            for rule in "${rules[@]}"; do
+                if ! [[ "$rule" =~ ^[[:space:]]*chain ]]; then
+                    local handle=$(echo "$rule" | awk '/handle/ {print $NF}')
+                    if [[ -n "$handle" ]]; then
+                        echo -e "${GREEN}[$i]${NC} - ${CYAN}(来自 ${chain_name})${NC} $rule"
+                        local action=$(echo "$rule" | awk '{ for(i=1; i<=NF; i++) { if ($i == "accept" || $i == "drop") { print $i; break; } } }')
+                        local ports=$(echo "$rule" | grep -o 'dport {.*}' | sed 's/dport //')
+                        all_rules_text+=("$rule")
+                        all_rules_handle+=("$handle")
+                        all_rules_chain+=("$chain_name")
+                        all_rules_action+=("$action")
+                        all_rules_ports+=("$ports")
+                        ((i++))
+                    fi
+                fi
+            done
+        done
+
+        if [ ${#all_rules_handle[@]} -eq 0 ]; then
+            echo -e "\n${YELLOW}没有用户添加的规则可供操作。${NC}"
+            press_any_key
+            break
+        fi
+
+        echo -e "\n${CYAN}操作提示: 'd 5'(删除), 'c 5'(更改), 'da'(全删), 'q'(返回).${NC}"
+        read -p "请输入您的操作和编号: " action_input
+
+        if [[ $action_input =~ ^[qQ]$ ]]; then break; fi
+
+        local action=$(echo "$action_input" | awk '{print tolower($1)}')
+        local choices_str=$(echo "$action_input" | cut -d' ' -f2-)
+
+        case "$action" in
+            da|deleteall)
+                read -p "警告: 您确定要删除所有 ${#all_rules_handle[@]} 条用户规则吗? (y/N): " confirm
+                if [[ "$confirm" =~ ^[yY]$ ]]; then
+                    for chain_name in "${user_chains[@]}"; do nft flush chain inet "${TABLE_NAME}" "$chain_name"; done
+                    apply_and_save_changes 0 "删除所有用户规则" false
+                    echo -e "${GREEN}所有规则已删除, 正在刷新...${NC}"; sleep 1
+                else
+                    echo -e "\n${YELLOW}操作已取消。${NC}"; sleep 1
+                fi
+                continue
+                ;;
+            d|delete)
+                read -ra choices <<< "$choices_str"
+                if [ ${#choices[@]} -eq 0 ]; then echo -e "\n${RED}输入为空或未提供编号。${NC}"; sleep 1; continue; fi
+                
+                local valid_choices=true
+                for choice in "${choices[@]}"; do
+                    if ! [[ "$choice" =~ ^[0-9]+$ && "$choice" -ge 1 && "$choice" -le ${#all_rules_handle[@]} ]]; then
+                        echo -e "\n${RED}输入错误: '$choice' 不是一个有效的编号。${NC}"; sleep 2; valid_choices=false; break
+                    fi
+                done
+                if ! $valid_choices; then continue; fi
+
+                local sorted_choices=($(for i in "${choices[@]}"; do echo "$i"; done | sort -nur))
+                echo -e "${YELLOW}准备删除规则编号: ${sorted_choices[*]}...${NC}"
+                local final_success=0; local deleted_count=0; local ports_to_flush=()
+                for choice in "${sorted_choices[@]}"; do
+                    local index=$((choice-1))
+                    local handle_to_delete=${all_rules_handle[$index]}
+                    local chain_to_delete_from=${all_rules_chain[$index]}
+                    local action_of_rule=${all_rules_action[$index]}
+                    local ports_of_rule=${all_rules_ports[$index]}
+                    nft delete rule inet "${TABLE_NAME}" "${chain_to_delete_from}" handle "${handle_to_delete}"
+                    if [ $? -eq 0 ]; then
+                        ((deleted_count++))
+                        if [[ "$action_of_rule" == "drop" ]]; then ports_to_flush+=("$ports_of_rule"); fi
+                    else
+                        final_success=1
+                    fi
+                done
+                apply_and_save_changes $final_success "删除 ${deleted_count} 条规则" false "del_block" "${ports_to_flush[@]}"
+                echo -e "${GREEN}操作完成, 正在刷新列表...${NC}"; sleep 1
+                ;;
+            c|change|edit)
+                read -ra choices <<< "$choices_str"
+                if [ ${#choices[@]} -ne 1 ]; then echo -e "\n${RED}错误: '更改' 操作一次只能处理一个编号。${NC}"; sleep 2; continue; fi
+                local choice=${choices[0]}
+
+                if ! [[ "$choice" =~ ^[0-9]+$ && "$choice" -ge 1 && "$choice" -le ${#all_rules_handle[@]} ]]; then
+                    echo -e "\n${RED}输入错误: '$choice' 不是一个有效的编号。${NC}"; sleep 2; continue
+                fi
+
+                local index=$((choice-1))
+                local handle_to_edit=${all_rules_handle[$index]}
+                local chain_to_edit=${all_rules_chain[$index]}
+                local rule_to_edit=${all_rules_text[$index]}
+
+                clear
+                echo -e "${BLUE}--- 正在更改规则 #${choice} ---${NC}"
+                echo -e "  ${YELLOW}当前规则:${NC} ${rule_to_edit}\n"
+                echo -e "${CYAN}请提供新值, 或直接按 Enter 保留原值。输入 'q' 取消。${NC}"
+
+                # --- Rule Parser ---
+                local current_ip_part=$(echo "$rule_to_edit" | grep -oE '(ip|ip6) (saddr|daddr) ([^ ]+|@[^ ]+)')
+                local current_ip_val=$(echo "$current_ip_part" | awk '{print $3}')
+                local current_port_part=$(echo "$rule_to_edit" | grep -oE '(tcp|udp) dport ([^ ]+|{[^}]+})')
+                local current_proto=$(echo "$current_port_part" | awk '{print $1}')
+                local current_ports_raw=$(echo "$current_port_part" | sed -E 's/(tcp|udp) dport \{? ?//; s/ ?\}?//; s/, / /g')
+                local current_ports=$(echo $current_ports_raw | sed 's/ /,/g') # For display
+                local current_action=$(echo "$rule_to_edit" | grep -oE '(accept|drop)')
+                local current_comment=$(echo "$rule_to_edit" | grep -oP 'comment "\K[^"]+')
+
+                # --- Interactive Prompting ---
+                local new_ip_val="" new_ports="" new_proto="" new_action="" new_comment=""
+                
+                # Edit IP if it exists in the rule
+                if [[ -n "$current_ip_val" ]]; then
+                    while true; do
+                        read -p "新 IP/CIDR/Set (例: @set_...): [${current_ip_val}]: " new_ip_val
+                        if [[ "$new_ip_val" =~ ^[qQ]$ ]]; then echo -e "\n${YELLOW}操作已取消。${NC}"; sleep 1; continue 2; fi
+                        new_ip_val=${new_ip_val:-$current_ip_val}
+                        if [[ "$(validate_ip_or_cidr "$new_ip_val")" == "invalid" ]]; then
+                            echo -e "${RED}IP、CIDR 或 Set (@name) 格式无效。${NC}"
+                        else
+                            break
+                        fi
+                    done
+                fi
+                
+                # Edit Port/Proto if they exist in the rule
+                if [[ -n "$current_proto" ]]; then
+                    read -p "新协议 (tcp/udp): [${current_proto}]: " new_proto
+                    if [[ "$new_proto" =~ ^[qQ]$ ]]; then echo -e "\n${YELLOW}操作已取消。${NC}"; sleep 1; continue 2; fi
+                    new_proto=${new_proto:-$current_proto}
+
+                    while true; do
+                        read -p "新端口 (单个, 逗号分隔, 或范围): [${current_ports}]: " new_ports
+                        if [[ "$new_ports" =~ ^[qQ]$ ]]; then echo -e "\n${YELLOW}操作已取消。${NC}"; sleep 1; continue 2; fi
+                        new_ports=${new_ports:-$current_ports}
+                        formatted_new_ports=$(validate_and_format_ports "$new_ports")
+                        if [ $? -eq 0 ]; then break; else echo -e "${RED}${formatted_new_ports}${NC}"; fi
+                    done
+                fi
+
+                # Edit Comment
+                read -p "新备注: [${current_comment}]: " new_comment
+                if [[ "$new_comment" =~ ^[qQ]$ ]]; then echo -e "\n${YELLOW}操作已取消。${NC}"; sleep 1; continue 2; fi
+                new_comment=${new_comment:-$current_comment}
+                
+                # --- Rule Reconstructor ---
+                # Determine command verb (add for allow chains, insert for block chains)
+                local command_verb="add"
+                if [[ "$chain_to_edit" == *BLACKLIST* || "$chain_to_edit" == *BLOCK* ]]; then
+                    command_verb="insert"
+                fi
+                
+                local new_cmd_args=("nft" "$command_verb" "rule" "inet" "${TABLE_NAME}" "${chain_to_edit}")
+                
+                # Re-add IP part if it exists
+                if [[ -n "$new_ip_val" ]]; then
+                    new_cmd_args+=($(echo "$current_ip_part" | awk -v val="$new_ip_val" '{$3=val; print $1, $2, $3}'))
+                fi
+
+                # Re-add Port/Proto part if it exists
+                if [[ -n "$new_proto" ]]; then
+                    new_cmd_args+=("$new_proto" "dport" "$formatted_new_ports")
+                fi
+                
+                new_cmd_args+=("$current_action" "comment" "\"$new_comment\"")
+
+                # --- Confirmation and Execution ---
+                echo -e "\n${CYAN}旧规则:${NC} ${rule_to_edit}"
+                echo -e "${CYAN}新规则:${NC} ${new_cmd_args[*]}"
+                read -p "您确定要应用此更改吗? (y/N): " confirm
+                if [[ "$confirm" =~ ^[yY]$ ]]; then
+                    echo -e "\n${YELLOW}正在应用更改...${NC}"
+                    nft delete rule inet "${TABLE_NAME}" "${chain_to_edit}" handle "${handle_to_edit}"
+                    if [ $? -eq 0 ]; then
+                        "${new_cmd_args[@]}"
+                        apply_and_save_changes $? "更改规则 #${choice}"
+                    else
+                        echo -e "${RED}错误: 删除旧规则失败, 操作已中止。${NC}"
+                        press_any_key
+                    fi
+                else
+                    echo -e "\n${YELLOW}操作已取消。${NC}"; sleep 1
+                fi
+                continue
+                ;;
+            *)
+                echo -e "\n${RED}无效操作。请输入 'd', 'c', 或 'da'。${NC}"
+                sleep 2
+                ;;
+        esac
+    done
+    echo -e "\n${YELLOW}已退出编辑模式。${NC}"
+    sleep 1
+}
 view_full_status() { clear; echo -e "${BLUE}--- 查看完整防火墙状态 ---${NC}\n"; nft list ruleset; press_any_key; }
 
 reset_firewall() {
@@ -439,7 +646,7 @@ f2b_reapply_config() {
     echo -e "${CYAN}  -> 正在强制覆盖 nftables-multiport.conf...${NC}"
     sudo tee /etc/fail2ban/action.d/nftables-multiport.conf << 'EOF' >/dev/null
 [Definition]
-# This file was programmatically generated by firewall.sh (v24.09.7)
+# This file was programmatically generated by firewall.sh (v24.09.10)
 # to provide a definitive fix. It uses hardcoded commands and does
 # not rely on problematic includes or variables.
 
@@ -466,7 +673,7 @@ EOF
     echo -e "${CYAN}  -> 正在强制覆盖 nftables-allports.conf...${NC}"
     sudo tee /etc/fail2ban/action.d/nftables-allports.conf << 'EOF' >/dev/null
 [Definition]
-# This file was programmatically generated by firewall.sh (v24.09.7)
+# This file was programmatically generated by firewall.sh (v24.09.10)
 
 actionstart = nft add table inet f2b-table; \
               nft add chain inet f2b-table f2b-chain-<name> { type filter hook input priority -1\; }; \
@@ -614,8 +821,17 @@ f2b_manual_action() {
     
     case $type_choice in
         1)
-            read -p "请输入要${action_text}的IP或CIDR: " target
-            if [[ -z "$target" ]]; then return; fi
+            local target
+            while true; do
+                read -p "请输入要${action_text}的IP或CIDR ('q'取消): " target
+                if [[ "$target" =~ ^[qQ]$ ]] || [[ -z "$target" ]]; then echo -e "\n${YELLOW}操作已取消。${NC}"; press_any_key; return; fi
+                if [[ "$(validate_ip_or_cidr "$target")" != "invalid" ]]; then
+                    break
+                else
+                    echo -e "${RED}错误: 输入的不是有效的IP地址或CIDR网段。请重新输入。${NC}"
+                fi
+            done
+
             echo -e "\n${YELLOW}正在对 ${target} 执行 ${action}...${NC}"
             if fail2ban-client set "$jail" "$action" "$target"; then
                 echo -e "${GREEN}成功！${NC}"
@@ -625,7 +841,7 @@ f2b_manual_action() {
             ;;
         2)
             local ip_set
-            ip_set=$(select_from_ipset "exclude_f2b")
+            ip_set=$(select_from_ipset)
             if [ $? -ne 0 ]; then return; fi
 
             echo -e "\n${YELLOW}正在从IP集 @${ip_set} 读取IP列表...${NC}"
@@ -669,7 +885,7 @@ f2b_change_params() {
 
     # Helper to get current value
     get_current_val() {
-        awk -v param="$1" 'BEGIN{FS="="} /^\[sshd\]/{in_sshd=1} /^\[.*\]/ && !/^\[sshd\]/{in_sshd=0} in_sshd && $1 ~ "^\\s*" param "\\s*" {gsub(/^[ \t]+|[ \t]+$/, "", $2); print $2; exit}' "$jail_local_path"
+        awk -v param="$1" 'BEGIN{FS="="} /^\[sshd\]/{in_sshd=1} /^\s*\[/ && !/^\[sshd\]/{in_sshd=0} in_sshd && $1 ~ "^\\s*" param "\\s*" {gsub(/^[ \t]+|[ \t]+$/, "", $2); print $2; exit}' "$jail_local_path"
     }
 
     local current_maxretry=$(get_current_val "maxretry")
@@ -683,31 +899,75 @@ f2b_change_params() {
     echo -e "\n${CYAN}请输入新值，或直接按Enter保留当前设置。${NC}"
     echo -e "${CYAN}时间单位: s(秒), m(分), h(时), d(天)。例如: 10m, 12h, 1d。${NC}"
 
-    read -p "新 'maxretry' (数字) [${current_maxretry}]: " new_maxretry
-    new_maxretry=${new_maxretry:-$current_maxretry}
-    read -p "新 'findtime' (时间) [${current_findtime}]: " new_findtime
-    new_findtime=${new_findtime:-$current_findtime}
-    read -p "新 'bantime' (时间) [${current_bantime}]: " new_bantime
-    new_bantime=${new_bantime:-$current_bantime}
+    local new_maxretry new_findtime new_bantime
+    while true; do
+        read -p "新 'maxretry' (数字) [${current_maxretry}]: " new_maxretry
+        new_maxretry=${new_maxretry:-$current_maxretry}
+        if [[ -z "$new_maxretry" ]] || [[ "$new_maxretry" =~ ^[0-9]+$ ]]; then
+            break
+        else
+            echo -e "${RED}错误: 'maxretry' 必须是一个纯数字。${NC}"
+        fi
+    done
+
+    while true; do
+        read -p "新 'findtime' (时间) [${current_findtime}]: " new_findtime
+        new_findtime=${new_findtime:-$current_findtime}
+        if [[ -z "$new_findtime" ]] || [[ "$new_findtime" =~ ^[0-9]+[smhd]?$ ]]; then
+            break
+        else
+            echo -e "${RED}错误: 'findtime' 格式无效。请使用数字或数字+单位 (s,m,h,d)。${NC}"
+        fi
+    done
+
+    while true; do
+        read -p "新 'bantime' (时间) [${current_bantime}]: " new_bantime
+        new_bantime=${new_bantime:-$current_bantime}
+        if [[ -z "$new_bantime" ]] || [[ "$new_bantime" =~ ^[0-9]+[smhd]?$ ]]; then
+            break
+        else
+            echo -e "${RED}错误: 'bantime' 格式无效。请使用数字或数字+单位 (s,m,h,d)。${NC}"
+        fi
+    done
 
     # Helper to update or add a parameter
     update_param() {
         local param_name=$1
         local new_value=$2
-        # Check if param exists in the [sshd] section
-        if awk '/\[sshd\]/{f=1} f && /^\s*'"$param_name"'\s*=/{print; f=0}' "$jail_local_path" | grep -q "$param_name"; then
-            # Exists, so replace it
-            sed -i "/\[sshd\]/,/\[.*\]/ s/^\s*${param_name}\s*=.*/${param_name} = ${new_value}/" "$jail_local_path"
+        local config_file=$3
+        local param_exists=false
+
+        # Use awk to safely check if the parameter exists in the [sshd] section.
+        if awk -v param="^\\s*${param_name}\\s*=" '
+            BEGIN { in_section=0 }
+            /^\[sshd\]/ { in_section=1; next }
+            /^\s*\[/ && !/^\[sshd\]/ { in_section=0 }
+            in_section && $0 ~ param { found=1; exit }
+            END { exit !found }
+        ' "$config_file"; then
+            param_exists=true
+        fi
+
+        if $param_exists; then
+            # Parameter found, replace it using awk for a safe, in-place edit.
+            # gawk's inplace extension is required for this to work.
+            awk -i inplace -v param_re="^\\s*${param_name}\\s*=.*" -v new_line="${param_name} = ${new_value}" '
+                BEGIN { in_section=0 }
+                /^\[sshd\]/ { in_section=1 }
+                /^\s*\[/ && !/^\[sshd\]/ { in_section=0 }
+                (in_section && $0 ~ param_re) { $0 = new_line }
+                { print }
+            ' "$config_file"
         else
-            # Doesn't exist, so add it
-            sed -i "/\[sshd\]/a ${param_name} = ${new_value}" "$jail_local_path"
+            # Parameter not found, add it safely after the [sshd] line.
+            sed -i "/^\[sshd\]/a ${param_name} = ${new_value}" "$config_file"
         fi
     }
 
     echo -e "\n${YELLOW}正在更新配置...${NC}"
-    if [[ -n "$new_maxretry" ]]; then update_param "maxretry" "$new_maxretry"; fi
-    if [[ -n "$new_findtime" ]]; then update_param "findtime" "$new_findtime"; fi
-    if [[ -n "$new_bantime" ]]; then update_param "bantime" "$new_bantime"; fi
+    if [[ -n "$new_maxretry" ]]; then update_param "maxretry" "$new_maxretry" "$jail_local_path"; fi
+    if [[ -n "$new_findtime" ]]; then update_param "findtime" "$new_findtime" "$jail_local_path"; fi
+    if [[ -n "$new_bantime" ]]; then update_param "bantime" "$new_bantime" "$jail_local_path"; fi
 
     echo -e "${GREEN}配置文件已更新。正在重载Fail2ban...${NC}"
     if fail2ban-client reload; then
@@ -777,7 +1037,7 @@ ssh_whitelist_manager() {
                 elif [[ "$source_set" == *_v6 ]]; then
                     dest_set=${F2B_SSH_WHITELIST_SET_V6}
                 else
-                     echo -e "${RED}选择的IP集名称不规范 (非_v4或_v6结尾)。${NC}"; sleep 2; continue;
+                    echo -e "${RED}选择的IP集名称不规范 (非_v4或_v6结尾)。${NC}"; sleep 2; continue;
                 fi
                 
                 echo -e "${YELLOW}正在从 @${source_set} 批量添加到 @${dest_set}...${NC}"
@@ -887,7 +1147,7 @@ ssh_change_port() {
     echo -e "\n${YELLOW}3. 正在更新 Fail2ban 配置...${NC}"
     if [ -f "$jail_local" ] && grep -q '\[sshd\]' "$jail_local"; then
         if awk '/\[sshd\]/{f=1} f && /port\s*=/ {print; f=0}' "$jail_local" | grep -q port; then
-             sed -i "/\[sshd\]/,/\[.*\]/ s/^\s*port\s*=.*/port = ${new_port}/" "$jail_local"
+            sed -i "/\[sshd\]/,/\[.*\]/ s/^\s*port\s*=.*/port = ${new_port}/" "$jail_local"
         else
             sed -i "/\[sshd\]/a port = ${new_port}" "$jail_local"
         fi
@@ -987,7 +1247,7 @@ reset_fail2ban_data() {
     if ls /var/log/fail2ban.log* 1> /dev/null 2>&1; then
         if rm -f /var/log/fail2ban.log*; then echo -e "${GREEN} -> 日志文件 '/var/log/fail2ban.log*' 已成功删除。${NC}"; else echo -e "${RED} -> 删除日志失败！请检查权限。${NC}"; fi
     else
-         echo -e "${CYAN} -> 日志文件不存在, 跳过。${NC}"
+        echo -e "${CYAN} -> 日志文件不存在, 跳过。${NC}"
     fi
     
     echo -e "\n${YELLOW}6. 正在清理 Fail2ban 配置文件中的内部白名单 (ignoreip)...${NC}"
@@ -1068,13 +1328,13 @@ toggle_ssh_defense_policy() {
             fi
 
             if [[ -n "$insertion_handle" ]]; then
-                 echo -e "\n${YELLOW}正在基于 [${insertion_point_desc}] 插入 Drop 规则...${NC}"
-                 nft insert rule inet "$TABLE_NAME" "$INPUT_CHAIN" handle "$insertion_handle" tcp dport "$formatted_ssh_ports" drop comment "\"$POLICY_COMMENT\""
-                 apply_and_save_changes $? "切换SSH防御策略为 [Drop]"
+                echo -e "\n${YELLOW}正在基于 [${insertion_point_desc}] 插入 Drop 规则...${NC}"
+                nft insert rule inet "$TABLE_NAME" "$INPUT_CHAIN" handle "$insertion_handle" tcp dport "$formatted_ssh_ports" drop comment "\"$POLICY_COMMENT\""
+                apply_and_save_changes $? "切换SSH防御策略为 [Drop]"
             else
-                 echo -e "\n${RED}致命错误: 未找到任何可用于插入规则的关键锚点 (Fail2ban链 或 核心SSH规则)。${NC}"
-                 echo -e "${YELLOW}您的防火墙可能处于不完整的状态。建议重置防火墙。${NC}"
-                 press_any_key
+                echo -e "\n${RED}致命错误: 未找到任何可用于插入规则的关键锚点 (Fail2ban链 或 核心SSH规则)。${NC}"
+                echo -e "${YELLOW}您的防火墙可能处于不完整的状态。建议重置防火墙。${NC}"
+                press_any_key
             fi
         else
             echo -e "\n${GREEN}操作已取消。${NC}"
@@ -1151,7 +1411,7 @@ fail2ban_ssh_manager_menu() {
         clear
         local defense_policy_status=$(get_ssh_defense_policy_status)
         echo -e "${PURPLE}======================================================${NC}"
-        echo -e "                         ${CYAN}Fail2ban 与 SSH 综合管理中心${NC}"
+        echo -e "                      ${CYAN}Fail2ban 与 SSH 综合管理中心${NC}"
         echo -e "${PURPLE}======================================================${NC}"
         echo -e "${BLUE}--- Fail2ban 管理 ---${NC}"
         echo -e " ${GREEN}1.${NC} 查看服务状态与统计"
@@ -1299,7 +1559,7 @@ add_socat_rule() {
         elif [[ "$listen_addr_choice" == "2" ]]; then
             listen_ip=$(select_specific_ip "$listen_family")
             if [ $? -ne 0 ]; then
-                 echo -e "\n${YELLOW}未选择IP地址, 操作已取消。${NC}"; press_any_key; return
+                echo -e "\n${YELLOW}未选择IP地址, 操作已取消。${NC}"; press_any_key; return
             fi
             break
         else
@@ -1465,7 +1725,7 @@ view_socat_rules() {
         
         echo -e "\n${PURPLE}---------------------------------[ 操作 ]---------------------------------${NC}"
         echo -e " ${GREEN}d <编号>${NC}    - ${RED}删除${NC}指定规则 (可多选, 如: d 1 3)"
-        echo -e " ${GREEN}da${NC}         - ${RED}删除所有${NC}规则"
+        echo -e " ${GREEN}da${NC}          - ${RED}删除所有${NC}规则"
         echo -e " ${GREEN}stop <编号>${NC} - 停止指定规则 (可多选)"
         echo -e " ${GREEN}start <编号>${NC}- 启动指定规则 (可多选)"
         echo -e "\n ${GREEN}q.${NC}          - 返回"
@@ -1552,7 +1812,7 @@ socat_manager_menu() {
     while true; do
         clear
         echo -e "${PURPLE}======================================================${NC}"
-        echo -e "                                      ${CYAN}轻量级端口转发 (Socat) 中心${NC}"
+        echo -e "                          ${CYAN}轻量级端口转发 (Socat) 中心${NC}"
         echo -e "${PURPLE}======================================================${NC}"
         echo -e "${YELLOW}此功能通过 systemd 管理 socat 进程, 实现持久化端口转发。${NC}"
         echo -e " ${GREEN}1.${NC} 添加新的转发规则"
@@ -1573,7 +1833,7 @@ detailed_network_monitor_menu() {
     while true; do
         clear
         echo -e "${PURPLE}======================================================${NC}"
-        echo -e "                                    ${CYAN}超级网络监控中心${NC}"
+        echo -e "                              ${CYAN}超级网络监控中心${NC}"
         echo -e "${PURPLE}======================================================${NC}"
         echo -e "${YELLOW}提供四个维度、预设好最佳参数的实时监控工具:${NC}"
         echo -e " ${GREEN}1.${NC} ${CYAN}按进程+连接监控 (nethogs)${NC}"
@@ -1730,7 +1990,7 @@ backup_restore_menu() {
     while true; do
         clear
         echo -e "${PURPLE}======================================================${NC}"
-        echo -e "                                      ${CYAN}备份与恢复中心${NC}"
+        echo -e "                              ${CYAN}备份与恢复中心${NC}"
         echo -e "${PURPLE}======================================================${NC}"
         echo -e " ${GREEN}1.${NC} 备份当前所有规则"
         echo -e " ${GREEN}2.${NC} ${RED}从文件恢复规则${NC}"
@@ -1812,7 +2072,7 @@ shortcut_manager_menu() {
     while true; do
         clear
         echo -e "${PURPLE}======================================================${NC}"
-        echo -e "                                      ${CYAN}终端快捷方式管理${NC}"
+        echo -e "                              ${CYAN}终端快捷方式管理${NC}"
         echo -e "${PURPLE}======================================================${NC}"
         echo -e " ${GREEN}1.${NC} 创建快捷方式 (命令: ${SHORTCUT_NAME})"
         echo -e " ${GREEN}2.${NC} ${RED}删除快捷方式${NC} (命令: ${SHORTCUT_NAME})"
@@ -1888,7 +2148,7 @@ main_menu() {
 
     clear
     echo -e "${PURPLE}======================================================${NC}"
-    echo -e "        ${CYAN}NFTables 防火墙管理器 (By Gemini v24.09.7)${NC}"
+    echo -e "        ${CYAN}NFTables 防火墙管理器 (By Gemini v24.09.10)${NC}"
     echo -e "${PURPLE}--------------------[ 系统状态 ]----------------------${NC}"
     echo -e " 入站策略: ${policy_input_color}${policy_input}${NC}  | 出站策略: ${YELLOW}${policy_output}${NC}  | 转发: ${forward_status}"
     echo -e " 开机自启: ${autostart_status} | Ping(IPv4): ${ipv4_ping_status} | SSH端口: ${ssh_port_info}"
@@ -1899,7 +2159,7 @@ main_menu() {
     echo -e " ${GREEN}3.${NC} ${YELLOW}新增 [入站端口封禁] 规则${NC}"
     echo -e " ${GREEN}4.${NC} 新增 [入站端口放行] 规则"
     echo -e " ${GREEN}5.${NC} IP 集管理 (国家/自定义)"
-    echo -e " ${GREEN}6.${NC} ${RED}删除用户规则 (增强模式)${NC}"
+    echo -e " ${GREEN}6.${NC} ${RED}编辑/删除 用户规则 (增强模式)${NC}"
     echo -e "\n${BLUE}--- 转发 & 出站 ---${NC}"
     echo -e " ${GREEN}7.${NC} ${YELLOW}新增 [出站IP/端口] 封锁${NC}"
     echo -e " ${GREEN}8.${NC} ${YELLOW}轻量级端口转发 (socat)${NC}"
@@ -1928,7 +2188,7 @@ while true; do
         3) add_rule_port_based "in" "drop" "入站端口封锁" ;;
         4) add_rule_port_based "in" "accept" "入站端口放行" ;;
         5) ipset_manager_menu ;;
-        6) delete_rule_visual ;;
+        6) edit_delete_rule_visual ;;
         7) 
             clear
             echo -e "${BLUE}--- 出站封锁菜单 ---${NC}"
