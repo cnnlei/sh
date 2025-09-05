@@ -3,9 +3,9 @@
 #================================================================
 #
 #   文件: firewall.sh
-#   描述: Nftables 防火墙可视化管理脚本 (终极修复增强版)
+#   描述: Nftables 防火墙可视化管理脚本 (根据您的要求定制版)
 #   作者: Gemini & 您
-#   版本: 25.09.04 (Feat: 重构规则管理, 新增高级交互式排序功能; 移除编辑功能)
+#   版本: 25.09.05 (Feat: 实现SSH白名单内置顶于Fail2ban链的方案)
 #
 #================================================================
 
@@ -40,7 +40,8 @@ install_dependencies() {
     else
         echo -e "${RED}错误: 未能识别出系统的包管理器 (apt, dnf, yum, pacman)。${NC}" >&2
         echo -e "${YELLOW}请您手动安装所需依赖后重试。${NC}" >&2
-        for cmd in nft conntrack curl split awk ip ss pgrep systemctl bmon nethogs iftop socat realpath; do
+        # MODIFIED: Added 'sudo' to the manual check list
+        for cmd in nft conntrack curl split awk ip ss pgrep systemctl bmon nethogs iftop socat realpath sudo; do
             if ! command -v $cmd &> /dev/null; then
                 echo -e "\n${RED}错误：核心命令 '$cmd' 未找到。请先手动安装。${NC}" >&2
                 exit 1
@@ -57,7 +58,7 @@ install_dependencies() {
                 [split]="coreutils" [awk]="gawk" [ip]="iproute2"
                 [ss]="iproute2" [pgrep]="procps" [systemctl]="systemd"
                 [bmon]="bmon" [nethogs]="nethogs" [iftop]="iftop" [socat]="socat"
-                [realpath]="realpath"
+                [realpath]="realpath" [sudo]="sudo" # MODIFIED: Added sudo package
             )
             ;;
         dnf|yum)
@@ -66,7 +67,7 @@ install_dependencies() {
                 [split]="coreutils" [awk]="gawk" [ip]="iproute"
                 [ss]="iproute" [pgrep]="procps-ng" [systemctl]="systemd"
                 [bmon]="bmon" [nethogs]="nethogs" [iftop]="iftop" [socat]="socat"
-                [realpath]="coreutils"
+                [realpath]="coreutils" [sudo]="sudo" # MODIFIED: Added sudo package
             )
             ;;
         pacman)
@@ -75,13 +76,14 @@ install_dependencies() {
                 [split]="coreutils" [awk]="gawk" [ip]="iproute2"
                 [ss]="iproute2" [pgrep]="procps-ng" [systemctl]="systemd"
                 [bmon]="bmon" [nethogs]="nethogs" [iftop]="iftop" [socat]="socat"
-                [realpath]="coreutils"
+                [realpath]="coreutils" [sudo]="sudo" # MODIFIED: Added sudo package
             )
             ;;
     esac
 
     local missing_pkgs=()
-    local cmds_to_check=("nft" "conntrack" "curl" "split" "awk" "ip" "ss" "pgrep" "systemctl" "bmon" "nethogs" "iftop" "socat" "realpath")
+    # MODIFIED: Added 'sudo' to the commands to check
+    local cmds_to_check=("nft" "conntrack" "curl" "split" "awk" "ip" "ss" "pgrep" "systemctl" "bmon" "nethogs" "iftop" "socat" "realpath" "sudo")
 
     for cmd in "${cmds_to_check[@]}"; do
         if ! command -v "$cmd" &>/dev/null; then
@@ -131,6 +133,7 @@ TABLE_NAME="filter"; INPUT_CHAIN="input"; OUTPUT_CHAIN="output"; USER_CHAIN="USE
 USER_IP_WHITELIST="USER_IP_WHITELIST"; USER_IP_BLACKLIST="USER_IP_BLACKLIST";
 USER_PORT_BLOCK="USER_PORT_BLOCK"; USER_PORT_ALLOW="USER_PORT_ALLOW";
 USER_OUT_IP_BLOCK="USER_OUT_IP_BLOCK"; USER_OUT_PORT_BLOCK="USER_OUT_PORT_BLOCK";
+F2B_TABLE_NAME="f2b-table"; # MODIFIED: Fail2ban专用表名
 F2B_SSH_WHITELIST_SET_V4="F2B_SSH_WHITELIST_V4"; F2B_SSH_WHITELIST_SET_V6="F2B_SSH_WHITELIST_V6";
 NFT_CONF_PATH="/etc/nftables.conf";
 COUNTRY_IP_DIR="/root/guojia"; CUSTOM_IP_DIR="/root/zd_ip";
@@ -232,9 +235,9 @@ apply_and_save_changes() {
     echo -e "${YELLOW}--> 正在自动保存所有规则...${NC}"
     nft list ruleset > ${NFT_CONF_PATH}
     if [ $? -eq 0 ]; then
-        echo -e "${GREEN}       规则已永久保存。${NC}"
+        echo -e "${GREEN}        规则已永久保存。${NC}"
     else
-        echo -e "${RED}       错误: 规则保存失败!${NC}"
+        echo -e "${RED}        错误: 规则保存失败!${NC}"
     fi
 
     if [[ "$rule_type" == "add_block" ]] || [[ "$rule_type" == "del_allow" ]]; then
@@ -247,30 +250,14 @@ apply_and_save_changes() {
     
     if $pause_after; then press_any_key; fi
 }
+# MODIFIED: This function's logic is now handled by the Fail2ban action file.
+# It is kept here but effectively disabled to prevent adding conflicting rules.
 ensure_ssh_whitelist_rules_exist() {
-    local comment_v4="\"SSH Whitelist IPv4 (Priority)\""
-    local comment_v6="\"SSH Whitelist IPv6 (Priority)\""
-    
-    local ssh_ports=$(ss -tlpn "sport = :*" 2>/dev/null | grep 'sshd' | grep -oE ':[0-9]+' | sed 's/://g' | sort -u | tr '\n' ',' | sed 's/,$//')
-    if [[ -z "$ssh_ports" ]]; then ssh_ports="22"; fi
-    if [[ "$ssh_ports" == *,* ]]; then ssh_ports="{ ${ssh_ports} }"; fi
-
-    local f2b_handle=$(nft --handle list chain inet "${TABLE_NAME}" "${INPUT_CHAIN}" 2>/dev/null | grep 'f2b-chain' | awk '{print $NF}')
-    
-    if ! nft list chain inet "${TABLE_NAME}" "${INPUT_CHAIN}" 2>/dev/null | grep -q "$comment_v4"; then
-        if [[ -n "$f2b_handle" ]]; then
-            nft insert rule inet ${TABLE_NAME} ${INPUT_CHAIN} handle ${f2b_handle} ip saddr @${F2B_SSH_WHITELIST_SET_V4} tcp dport ${ssh_ports} accept comment ${comment_v4}
-        else
-            nft add rule inet ${TABLE_NAME} ${INPUT_CHAIN} position 3 ip saddr @${F2B_SSH_WHITELIST_SET_V4} tcp dport ${ssh_ports} accept comment ${comment_v4}
-        fi
-    fi
-    if ! nft list chain inet ${TABLE_NAME} "${INPUT_CHAIN}" 2>/dev/null | grep -q "$comment_v6"; then
-        if [[ -n "$f2b_handle" ]]; then
-            nft insert rule inet ${TABLE_NAME} ${INPUT_CHAIN} handle ${f2b_handle} ip6 saddr @${F2B_SSH_WHITELIST_SET_V6} tcp dport ${ssh_ports} accept comment ${comment_v6}
-        else
-            nft add rule inet ${TABLE_NAME} ${INPUT_CHAIN} position 3 ip6 saddr @${F2B_SSH_WHITELIST_SET_V6} tcp dport ${ssh_ports} accept comment ${comment_v6}
-        fi
-    fi
+    # This function's original purpose was to add whitelist rules to the 'filter' table.
+    # Per your request, this logic is now integrated directly into the Fail2ban action
+    # file ('f2b-table'), making this function's logic obsolete and potentially harmful.
+    # It is intentionally left empty.
+    :
 }
 initialize_firewall() {
     if ! nft list chain inet "${TABLE_NAME}" "${USER_CHAIN}" &>/dev/null; then
@@ -311,22 +298,15 @@ initialize_firewall() {
         nft add rule inet ${TABLE_NAME} ${USER_CHAIN} jump ${USER_PORT_BLOCK} comment "\"优先级3:端口封锁\""
         nft add rule inet ${TABLE_NAME} ${USER_CHAIN} jump ${USER_PORT_ALLOW} comment "\"优先级4:端口放行\""
         
-        # 为SSH白名单创建set
-        nft add set inet ${TABLE_NAME} ${F2B_SSH_WHITELIST_SET_V4} '{ type ipv4_addr; flags interval; }'
-        nft add set inet ${TABLE_NAME} ${F2B_SSH_WHITELIST_SET_V6} '{ type ipv6_addr; flags interval; }'
+        # MODIFIED: SSH Whitelist sets are no longer created here.
+        # They are now created as part of the Fail2ban table (`f2b-table`) setup.
 
         echo -e "${GREEN}防火墙已初始化为全新的多链安全架构。${NC}"
         nft list ruleset > ${NFT_CONF_PATH}
         echo -e "\n${PURPLE}提示: 为确保系统重启后防火墙规则自动加载, 建议执行: systemctl enable nftables.service${NC}"
         sleep 3
     fi
-    # 确保SSH白名单set存在, 兼容旧版本升级
-    if ! nft list set inet ${TABLE_NAME} ${F2B_SSH_WHITELIST_SET_V4} &>/dev/null; then
-        nft add set inet ${TABLE_NAME} ${F2B_SSH_WHITELIST_SET_V4} '{ type ipv4_addr; flags interval; }'
-    fi
-    if ! nft list set inet ${TABLE_NAME} ${F2B_SSH_WHITELIST_SET_V6} &>/dev/null; then
-        nft add set inet ${TABLE_NAME} ${F2B_SSH_WHITELIST_SET_V6} '{ type ipv6_addr; flags interval; }'
-    fi
+    # MODIFIED: The compatibility check for old sets is no longer needed here.
     mkdir -p "${COUNTRY_IP_DIR}" "${CUSTOM_IP_DIR}"
 }
 
@@ -388,6 +368,7 @@ select_host_target() { local ip_type=${1:-""}; local direction=$2; local target_
 # --- 规则添加/删除功能 ---
 add_rule_ip_based() { local direction=$1; local action=$2; local title=$3; local target_chain=""; local rule_ip_prop; local ip_input=""; local is_set=false; local final_status=0; local ip_type=""; local rule_type=""; if [[ "$direction" == "in" ]]; then if [[ "$action" == "accept" ]]; then target_chain="${USER_IP_WHITELIST}"; rule_type="add_allow"; else target_chain="${USER_IP_BLACKLIST}"; rule_type="add_block"; fi; rule_ip_prop="saddr"; elif [[ "$direction" == "out" ]]; then target_chain="${USER_OUT_IP_BLOCK}"; action="drop"; rule_ip_prop="daddr"; rule_type="add_block"; else echo -e "${RED}错误: 无效的规则方向。${NC}"; press_any_key; return; fi; clear; echo -e "${BLUE}--- ${title} ---${NC}\n"; echo -e "${CYAN}请选择操作对象:${NC}"; echo " 1) 手动输入IP/网段 (默认)"; echo " 2) 从已有的IP集中选择"; local choice_obj; read -p "#? (默认: 1): " choice_obj; choice_obj=${choice_obj:-1}; local prompt=""; if [[ "$direction" == "in" ]]; then prompt="请输入源IP地址或网段 ('q'返回): "; else prompt="请输入目标IP地址或网段 ('q'返回): "; fi; if [[ "$choice_obj" == "2" ]]; then ip_input=$(select_from_ipset); if [ $? -ne 0 ]; then echo -e "\n${YELLOW}操作已取消。${NC}"; sleep 1; return; fi; is_set=true; if [[ "$ip_input" == *_v6 ]] || [[ "$ip_input" == *_V6 ]]; then ip_type="ipv6"; else ip_type="ipv4"; fi; else while true; do read -p "$prompt" ip_input; if [[ $ip_input =~ ^[qQ]$ ]]; then echo -e "\n${YELLOW}操作已取消。${NC}"; sleep 1; return; fi; ip_type=$(validate_ip_or_cidr "$ip_input"); if [[ "$ip_type" != "invalid" ]]; then break; else echo -e "${RED}IP地址格式错误。${NC}"; fi; done; fi; while true; do echo -e "\n${CYAN}请选择协议:${NC}"; echo -e " 1) 所有协议 (默认)"; echo -e " 2) TCP"; echo -e " 3) UDP"; echo -e " 4) ICMP"; echo -e " 5) ICMPv6"; echo -e " 6) 手动输入"; echo -e " q) 返回"; read -p "#? (默认: 1): " choice; choice=${choice:-1}; case $choice in 1) protocol=""; break;; 2) protocol="tcp"; break;; 3) protocol="udp"; break;; 4) protocol="icmp"; break;; 5) protocol="icmpv6"; break;; 6) read -p "协议名: " protocol; break;; [qQ]) echo -e "\n${YELLOW}操作已取消。${NC}"; sleep 1; return ;; *) echo -e "${RED}无效选择, 请重新输入。${NC}";; esac; done; local port_input=""; local formatted_ports=""; if [[ -n "$protocol" && "$protocol" != "icmp" && "$protocol" != "icmpv6" ]]; then while true; do echo -e "\n${CYAN}支持格式 - 单个:80, 多个:80,443, 范围:1000-2000${NC}"; read -p "请输入端口('q'返回,留空为所有): " port_input; if [[ $port_input =~ ^[qQ]$ ]]; then echo -e "\n${YELLOW}操作已取消。${NC}"; sleep 1; return; fi; formatted_ports=$(validate_and_format_ports "$port_input"); if [ $? -eq 0 ]; then break; else echo -e "${RED}${formatted_ports}${NC}"; fi; done; fi; local target_info; target_info=$(select_host_target "$ip_type" "$direction"); if [ $? -ne 0 ] || [[ -z "$target_info" ]]; then echo -e "\n${YELLOW}操作已取消。${NC}"; sleep 1; return; fi; local target_type=$(echo "$target_info" | cut -d: -f1); local target_value=$(echo "$target_info" | cut -d: -f2-); read -p "请输入备注 (可选, 'q'取消): " comment; if [[ $comment =~ ^[qQ]$ ]]; then echo -e "\n${YELLOW}操作已取消。${NC}"; sleep 1; return; fi; local base_cmd=("nft" "insert" "rule" "inet" "${TABLE_NAME}" "${target_chain}"); local entity_desc="${title} ${ip_input}"; if [[ -n "$target_value" ]]; then entity_desc+=" -> ${target_type}:\"${target_value}\""; fi; if [[ -n "$protocol" ]]; then entity_desc+=" [协议:${protocol}]"; fi; if [[ -n "$port_input" ]]; then entity_desc+=" [端口:${port_input}]"; fi; local cmd_args=("${base_cmd[@]}"); local ip_prefix="ip"; if [[ "$ip_type" == "ipv6" ]]; then ip_prefix="ip6"; fi; if [[ -n "$target_value" ]]; then cmd_args+=("$ip_prefix" "$target_type" "\"$target_value\""); fi; if $is_set; then cmd_args+=("$ip_prefix" "$rule_ip_prop" "@$ip_input"); else cmd_args+=("$ip_prefix" "$rule_ip_prop" "$ip_input"); fi; if [[ -n "$protocol" ]]; then if [[ -n "$formatted_ports" ]]; then cmd_args+=("$protocol" "dport" "$formatted_ports"); else cmd_args+=("meta" "l4proto" "$protocol"); fi; fi; local rule_comment="${comment:-Rule_for_${ip_input}}"; cmd_args+=("$action" "comment" "\"$rule_comment\""); echo -e "${YELLOW}执行: ${cmd_args[*]}${NC}"; "${cmd_args[@]}"; final_status=$?; apply_and_save_changes $final_status "$entity_desc" "true" "$rule_type" "$port_input"; }
 add_rule_port_based() { local direction=$1; local action=$2; local title=$3; local target_chain=""; local final_status=0; local ip_input="" ip_type="" is_set=false; local rule_type=""; if [[ "$direction" == "in" ]]; then if [[ "$action" == "accept" ]]; then target_chain="${USER_PORT_ALLOW}"; rule_type="add_allow"; else target_chain="${USER_PORT_BLOCK}"; rule_type="add_block"; fi; elif [[ "$direction" == "out" ]]; then target_chain="${USER_OUT_PORT_BLOCK}"; action="drop"; rule_type="add_block"; else echo -e "${RED}错误: 无效的规则方向。${NC}"; press_any_key; return; fi; clear; echo -e "${BLUE}--- ${title} ---${NC}\n"; while true; do echo -e "${CYAN}支持格式 - 单个:80, 多个:80,443, 范围:1000-2000${NC}"; read -p "请输入要操作的端口 (输入 'q' 返回): " port_input; if [[ $port_input =~ ^[qQ]$ ]]; then echo -e "\n${YELLOW}操作已取消。${NC}"; sleep 1; return; fi; formatted_ports=$(validate_and_format_ports "$port_input"); if [[ $? -eq 0 && -n "$formatted_ports" ]]; then break; else echo -e "${RED}输入无效或为空。${NC}"; fi; done; local ip_prop_text; [[ "$direction" == "in" ]] && ip_prop_text="来源" || ip_prop_text="目标"; echo -e "\n${CYAN}请选择此规则的IP${ip_prop_text}:${NC}"; echo " 1) 所有IP (默认)"; echo " 2) 指定单个IP/网段"; echo " 3) 从已有的IP集中选择"; local choice_ip_source; read -p "#? (默认: 1): " choice_ip_source; choice_ip_source=${choice_ip_source:-1}; case $choice_ip_source in 2) local prompt="请输入${ip_prop_text}IP地址或网段 ('q'返回): "; while true; do read -p "$prompt" ip_input; if [[ $ip_input =~ ^[qQ]$ ]]; then echo -e "\n${YELLOW}操作已取消。${NC}"; sleep 1; return; fi; ip_type=$(validate_ip_or_cidr "$ip_input"); if [[ "$ip_type" != "invalid" ]]; then break; else echo -e "${RED}IP地址格式错误。${NC}"; fi; done ;; 3) ip_input=$(select_from_ipset); if [ $? -ne 0 ]; then echo -e "\n${YELLOW}操作已取消。${NC}"; sleep 1; return; fi; is_set=true; if [[ "$ip_input" == *_v6 ]] || [[ "$ip_input" == *_V6 ]]; then ip_type="ipv6"; else ip_type="ipv4"; fi ;; *) ip_input="" ;; esac; local target_info; target_info=$(select_host_target "$ip_type" "$direction"); if [ $? -ne 0 ] || [[ -z "$target_info" ]]; then echo -e "\n${YELLOW}操作已取消。${NC}"; sleep 1; return; fi; local target_type=$(echo "$target_info" | cut -d: -f1); local target_value=$(echo "$target_info" | cut -d: -f2-); while true; do echo -e "\n${CYAN}请选择协议:${NC}"; echo -e " 1) All (TCP+UDP) (默认)"; echo -e " 2) TCP"; echo -e " 3) UDP"; echo -e " q) 返回"; read -p "#? (默认: 1. All): " choice; choice=${choice:-1}; case $choice in 1) protocols_to_add=("tcp" "udp"); protocol_desc="TCP+UDP"; break;; 2) protocols_to_add=("tcp"); protocol_desc="TCP"; break;; 3) protocols_to_add=("udp"); protocol_desc="UDP"; break;; [qQ]) echo -e "\n${YELLOW}操作已取消。${NC}"; sleep 1; return;; *) echo -e "${RED}无效选择。${NC}";; esac; done; read -p "请输入备注 (可选, 'q'取消): " comment; if [[ $comment =~ ^[qQ]$ ]]; then echo -e "\n${YELLOW}操作已取消。${NC}"; sleep 1; return; fi; local command_verb; if [[ "$action" == "accept" ]]; then command_verb="add"; else command_verb="insert"; fi; local entity_desc="${title} 端口:${port_input}"; if [[ -n "$ip_input" ]]; then entity_desc+=" (IP ${ip_prop_text}:${ip_input})"; fi; if [[ -n "$target_value" ]]; then entity_desc+=" -> ${target_type}:\"${target_value}\""; fi; entity_desc+=" [协议: ${protocol_desc}]"; for proto in "${protocols_to_add[@]}"; do local full_comment="${comment:-${action^}_Port_$(echo "$port_input" | sed 's/,/_/g')}_${proto}}"; local base_cmd_args=("nft" "${command_verb}" "rule" "inet" "${TABLE_NAME}" "${target_chain}"); if [[ -n "$target_value" ]]; then local host_ip_version=$(validate_ip_or_cidr "$target_value"); if [[ "$host_ip_version" == "ipv6" ]]; then base_cmd_args+=("ip6"); elif [[ "$host_ip_version" == "ipv4" ]]; then base_cmd_args+=("ip"); fi; base_cmd_args+=("$target_type" "\"$target_value\""); fi; if [[ -n "$ip_input" ]]; then local ip_prop; [[ "$direction" == "in" ]] && ip_prop="saddr" || ip_prop="daddr"; local ip_prefix; [[ "$ip_type" == "ipv6" ]] && ip_prefix="ip6" || ip_prefix="ip"; base_cmd_args+=("$ip_prefix" "$ip_prop"); if $is_set; then base_cmd_args+=("@$ip_input"); else base_cmd_args+=("$ip_input"); fi; fi; base_cmd_args+=("$proto" "dport" "$formatted_ports" "$action" "comment" "\"$full_comment\""); echo -e "${YELLOW}执行命令: ${base_cmd_args[*]}${NC}"; "${base_cmd_args[@]}"; if [ $? -ne 0 ]; then final_status=1; fi; done; apply_and_save_changes $final_status "$entity_desc" "true" "$rule_type" "$port_input"; }
+# [第二部分开始]
 
 edit_delete_rule_visual() {
     local user_chains=("${USER_IP_WHITELIST}" "${USER_IP_BLACKLIST}" "${USER_PORT_BLOCK}" "${USER_PORT_ALLOW}" "${USER_OUT_IP_BLOCK}" "${USER_OUT_PORT_BLOCK}")
@@ -693,8 +674,10 @@ toggle_default_policy() {
 }
 
 # --- Fail2ban & SSH Manager ---
+# MODIFIED: Major changes to implement your desired logic.
+# The action files now create the SSH whitelist sets and rules directly within the f2b-table.
 f2b_reapply_config() {
-    echo -e "\n${YELLOW}--> 正在应用终极版 Fail2ban 修复方案...${NC}"
+    echo -e "\n${YELLOW}--> 正在应用终极版 Fail2ban 修复方案 (定制版)...${NC}"
     
     # 1. 停止服务，确保环境干净
     echo -e "${CYAN}  -> 正在停止 Fail2ban 服务...${NC}"
@@ -702,25 +685,29 @@ f2b_reapply_config() {
 
     # 2. 强制覆盖action文件，使用已知正确的、无依赖的硬编码版本
     echo -e "${CYAN}  -> 正在强制覆盖 nftables-multiport.conf...${NC}"
-    sudo tee /etc/fail2ban/action.d/nftables-multiport.conf << 'EOF' >/dev/null
+    sudo tee /etc/fail2ban/action.d/nftables-multiport.conf << EOF >/dev/null
 [Definition]
-# This file was programmatically generated by firewall.sh (v25.09.04)
-# Definitive fix for OLD nftables versions, using separate sets for v4/v6.
+# This file was programmatically generated by firewall.sh (v25.09.05 - Custom)
+# Places SSH Whitelist rules directly into the Fail2ban chain.
 
-actionstart = nft 'add table inet f2b-table'
-              nft 'add set inet f2b-table addr-set-v4-<name> { type ipv4_addr; flags interval; }'
-              nft 'add set inet f2b-table addr-set-v6-<name> { type ipv6_addr; flags interval; }'
-              nft 'add chain inet f2b-table f2b-chain-<name> { type filter hook input priority -1; }'
-              nft 'add rule inet f2b-table f2b-chain-<name> ip saddr @addr-set-v4-<name> reject'
-              nft 'add rule inet f2b-table f2b-chain-<name> ip6 saddr @addr-set-v6-<name> reject'
+actionstart = nft 'add table inet ${F2B_TABLE_NAME}'
+              nft 'add set inet ${F2B_TABLE_NAME} ${F2B_SSH_WHITELIST_SET_V4} { type ipv4_addr; flags interval; }'
+              nft 'add set inet ${F2B_TABLE_NAME} ${F2B_SSH_WHITELIST_SET_V6} { type ipv6_addr; flags interval; }'
+              nft 'add set inet ${F2B_TABLE_NAME} addr-set-v4-<name> { type ipv4_addr; flags interval; }'
+              nft 'add set inet ${F2B_TABLE_NAME} addr-set-v6-<name> { type ipv6_addr; flags interval; }'
+              nft 'add chain inet ${F2B_TABLE_NAME} f2b-chain-<name> { type filter hook input priority -1; }'
+              nft 'add rule inet ${F2B_TABLE_NAME} f2b-chain-<name> ip saddr @${F2B_SSH_WHITELIST_SET_V4} accept'
+              nft 'add rule inet ${F2B_TABLE_NAME} f2b-chain-<name> ip6 saddr @${F2B_SSH_WHITELIST_SET_V6} accept'
+              nft 'add rule inet ${F2B_TABLE_NAME} f2b-chain-<name> ip saddr @addr-set-v4-<name> reject'
+              nft 'add rule inet ${F2B_TABLE_NAME} f2b-chain-<name> ip6 saddr @addr-set-v6-<name> reject'
 
-actionstop = nft 'delete table inet f2b-table'
+actionstop = nft 'delete table inet ${F2B_TABLE_NAME}'
 
-actioncheck = nft 'list table inet f2b-table'
+actioncheck = nft 'list table inet ${F2B_TABLE_NAME}'
 
-actionban = if [ "<family>" = "inet6" ]; then nft 'add element inet f2b-table addr-set-v6-<name> { <ip> }'; else nft 'add element inet f2b-table addr-set-v4-<name> { <ip> }'; fi
+actionban = if [ "<family>" = "inet6" ]; then nft 'add element inet ${F2B_TABLE_NAME} addr-set-v6-<name> { <ip> }'; else nft 'add element inet ${F2B_TABLE_NAME} addr-set-v4-<name> { <ip> }'; fi
 
-actionunban = if [ "<family>" = "inet6" ]; then nft 'delete element inet f2b-table addr-set-v6-<name> { <ip> }'; else nft 'delete element inet f2b-table addr-set-v4-<name> { <ip> }'; fi
+actionunban = if [ "<family>" = "inet6" ]; then nft 'delete element inet ${F2B_TABLE_NAME} addr-set-v6-<name> { <ip> }'; else nft 'delete element inet ${F2B_TABLE_NAME} addr-set-v4-<name> { <ip> }'; fi
 
 [Init]
 # Default values for multiport action
@@ -730,25 +717,29 @@ protocol = tcp
 EOF
     
     echo -e "${CYAN}  -> 正在强制覆盖 nftables-allports.conf...${NC}"
-    sudo tee /etc/fail2ban/action.d/nftables-allports.conf << 'EOF' >/dev/null
+    sudo tee /etc/fail2ban/action.d/nftables-allports.conf << EOF >/dev/null
 [Definition]
-# This file was programmatically generated by firewall.sh (v25.09.04)
-# Definitive fix for OLD nftables versions, using separate sets for v4/v6.
+# This file was programmatically generated by firewall.sh (v25.09.05 - Custom)
+# Places SSH Whitelist rules directly into the Fail2ban chain.
 
-actionstart = nft 'add table inet f2b-table'
-              nft 'add set inet f2b-table addr-set-v4-<name> { type ipv4_addr; flags interval; }'
-              nft 'add set inet f2b-table addr-set-v6-<name> { type ipv6_addr; flags interval; }'
-              nft 'add chain inet f2b-table f2b-chain-<name> { type filter hook input priority -1; }'
-              nft 'add rule inet f2b-table f2b-chain-<name> ip saddr @addr-set-v4-<name> reject'
-              nft 'add rule inet f2b-table f2b-chain-<name> ip6 saddr @addr-set-v6-<name> drop'
+actionstart = nft 'add table inet ${F2B_TABLE_NAME}'
+              nft 'add set inet ${F2B_TABLE_NAME} ${F2B_SSH_WHITELIST_SET_V4} { type ipv4_addr; flags interval; }'
+              nft 'add set inet ${F2B_TABLE_NAME} ${F2B_SSH_WHITELIST_SET_V6} { type ipv6_addr; flags interval; }'
+              nft 'add set inet ${F2B_TABLE_NAME} addr-set-v4-<name> { type ipv4_addr; flags interval; }'
+              nft 'add set inet ${F2B_TABLE_NAME} addr-set-v6-<name> { type ipv6_addr; flags interval; }'
+              nft 'add chain inet ${F2B_TABLE_NAME} f2b-chain-<name> { type filter hook input priority -1; }'
+              nft 'add rule inet ${F2B_TABLE_NAME} f2b-chain-<name> ip saddr @${F2B_SSH_WHITELIST_SET_V4} accept'
+              nft 'add rule inet ${F2B_TABLE_NAME} f2b-chain-<name> ip6 saddr @${F2B_SSH_WHITELIST_SET_V6} accept'
+              nft 'add rule inet ${F2B_TABLE_NAME} f2b-chain-<name> ip saddr @addr-set-v4-<name> reject'
+              nft 'add rule inet ${F2B_TABLE_NAME} f2b-chain-<name> ip6 saddr @addr-set-v6-<name> drop'
 
-actionstop = nft 'delete table inet f2b-table'
+actionstop = nft 'delete table inet ${F2B_TABLE_NAME}'
 
-actioncheck = nft 'list table inet f2b-table'
+actioncheck = nft 'list table inet ${F2B_TABLE_NAME}'
 
-actionban = if [ "<family>" = "inet6" ]; then nft 'add element inet f2b-table addr-set-v6-<name> { <ip> }'; else nft 'add element inet f2b-table addr-set-v4-<name> { <ip> }'; fi
+actionban = if [ "<family>" = "inet6" ]; then nft 'add element inet ${F2B_TABLE_NAME} addr-set-v6-<name> { <ip> }'; else nft 'add element inet ${F2B_TABLE_NAME} addr-set-v4-<name> { <ip> }'; fi
 
-actionunban = if [ "<family>" = "inet6" ]; then nft 'delete element inet f2b-table addr-set-v6-<name> { <ip> }'; else nft 'delete element inet f2b-table addr-set-v4-<name> { <ip> }'; fi
+actionunban = if [ "<family>" = "inet6" ]; then nft 'delete element inet ${F2B_TABLE_NAME} addr-set-v6-<name> { <ip> }'; else nft 'delete element inet ${F2B_TABLE_NAME} addr-set-v4-<name> { <ip> }'; fi
 
 [Init]
 # Default values for allports action
@@ -792,7 +783,7 @@ EOF
 
     # 4. 清理旧的防火墙状态并重启
     echo -e "${CYAN}  -> 正在清理旧的防火墙规则...${NC}"
-    nft delete table inet f2b-table &>/dev/null
+    nft delete table inet ${F2B_TABLE_NAME} &>/dev/null
     
     echo -e "\n${YELLOW}--> 正在重启 Fail2ban 服务以应用全新配置...${NC}"
     if ! systemctl restart fail2ban; then
@@ -919,7 +910,7 @@ f2b_manual_action() {
             local success_count=0
             local fail_count=0
             for ip in "${ips_to_process[@]}"; do
-                echo -ne "    -> ${action_text} ${ip}... "
+                echo -ne "     -> ${action_text} ${ip}... "
                 if fail2ban-client set "$jail" "$action" "$ip" >/dev/null; then
                     echo -e "${GREEN}成功${NC}"
                     ((success_count++))
@@ -1061,20 +1052,21 @@ f2b_change_params() {
     press_any_key
 }
 
+# MODIFIED: All nft commands now point to the f2b-table for whitelist management.
 ssh_whitelist_manager() {
     if ! systemctl is-active --quiet fail2ban; then
         echo -e "${RED}错误: Fail2ban服务未运行, 无法安全管理白名单。${NC}"; press_any_key; return
     fi
     
-    ensure_ssh_whitelist_rules_exist >/dev/null 2>&1
+    # ensure_ssh_whitelist_rules_exist is now obsolete
 
     while true; do
         clear
-        echo -e "${BLUE}--- SSH 白名单管理 (优先于Fail2ban) ---${NC}\n"
-        echo -e "${YELLOW}此处的IP将被防火墙无条件放行SSH端口, 不会触发Fail2ban。${NC}\n"
+        echo -e "${BLUE}--- SSH 白名单管理 (内置于Fail2ban链) ---${NC}\n"
+        echo -e "${YELLOW}此处的IP将被Fail2ban链优先放行, 不会触发封禁。${NC}\n"
         
-        mapfile -t whitelist_v4 < <(nft list set inet ${TABLE_NAME} ${F2B_SSH_WHITELIST_SET_V4} 2>/dev/null | grep -oP '(?<={ ).*(?= })' | tr -d ' ' | tr ',' '\n' | sort -u)
-        mapfile -t whitelist_v6 < <(nft list set inet ${TABLE_NAME} ${F2B_SSH_WHITELIST_SET_V6} 2>/dev/null | grep -oP '(?<={ ).*(?= })' | tr -d ' ' | tr ',' '\n' | sort -u)
+        mapfile -t whitelist_v4 < <(nft list set inet ${F2B_TABLE_NAME} ${F2B_SSH_WHITELIST_SET_V4} 2>/dev/null | grep -oP '(?<={ ).*(?= })' | tr -d ' ' | tr ',' '\n' | sort -u)
+        mapfile -t whitelist_v6 < <(nft list set inet ${F2B_TABLE_NAME} ${F2B_SSH_WHITELIST_SET_V6} 2>/dev/null | grep -oP '(?<={ ).*(?= })' | tr -d ' ' | tr ',' '\n' | sort -u)
         
         local all_ips=("${whitelist_v4[@]}" "${whitelist_v6[@]}")
         
@@ -1100,10 +1092,10 @@ ssh_whitelist_manager() {
                 read -p "请输入要添加的IP/CIDR: " ip_input
                 local ip_type=$(validate_ip_or_cidr "$ip_input")
                 if [[ "$ip_type" == "ipv4" ]]; then
-                    nft add element inet ${TABLE_NAME} ${F2B_SSH_WHITELIST_SET_V4} "{ ${ip_input} }"
+                    nft add element inet ${F2B_TABLE_NAME} ${F2B_SSH_WHITELIST_SET_V4} "{ ${ip_input} }"
                     apply_and_save_changes $? "添加IPv4到SSH白名单: ${ip_input}" false
                 elif [[ "$ip_type" == "ipv6" ]]; then
-                    nft add element inet ${TABLE_NAME} ${F2B_SSH_WHITELIST_SET_V6} "{ ${ip_input} }"
+                    nft add element inet ${F2B_TABLE_NAME} ${F2B_SSH_WHITELIST_SET_V6} "{ ${ip_input} }"
                     apply_and_save_changes $? "添加IPv6到SSH白名单: ${ip_input}" false
                 else
                     echo -e "${RED}IP地址格式无效。${NC}"; sleep 1
@@ -1124,9 +1116,10 @@ ssh_whitelist_manager() {
                 fi
                 
                 echo -e "${YELLOW}正在从 @${source_set} 批量添加到 @${dest_set}...${NC}"
+                # MODIFIED: Points to TABLE_NAME for user sets, but F2B_TABLE_NAME for destination set
                 local elements=$(nft list set inet ${TABLE_NAME} ${source_set} | grep "elements = " | sed -e 's/.*elements = //')
                 if [[ -n "$elements" ]]; then
-                    nft add element inet ${TABLE_NAME} ${dest_set} "$elements"
+                    nft add element inet ${F2B_TABLE_NAME} ${dest_set} "$elements"
                     apply_and_save_changes $? "从IP集 @${source_set} 添加到SSH白名单" false
                 else
                     echo -e "${YELLOW}源IP集为空, 无操作。${NC}"; sleep 1
@@ -1142,8 +1135,8 @@ ssh_whitelist_manager() {
                 if [[ "${del_input,,}" == "da" || "${del_input,,}" == "deleteall" ]]; then
                     read -p "警告：您确定要删除所有SSH白名单IP吗? (y/N): " confirm
                     if [[ "$confirm" =~ ^[yY]$ ]]; then
-                        nft flush set inet ${TABLE_NAME} ${F2B_SSH_WHITELIST_SET_V4}
-                        nft flush set inet ${TABLE_NAME} ${F2B_SSH_WHITELIST_SET_V6}
+                        nft flush set inet ${F2B_TABLE_NAME} ${F2B_SSH_WHITELIST_SET_V4}
+                        nft flush set inet ${F2B_TABLE_NAME} ${F2B_SSH_WHITELIST_SET_V6}
                         apply_and_save_changes $? "清空所有SSH白名单" false
                     else
                         echo -e "${YELLOW}操作已取消。${NC}"
@@ -1171,7 +1164,7 @@ ssh_whitelist_manager() {
                         elif [[ "$ip_type" == "ipv6" ]]; then target_set=${F2B_SSH_WHITELIST_SET_V6}; fi
                         
                         if [[ -n "$target_set" ]]; then
-                            nft delete element inet ${TABLE_NAME} ${target_set} "{ ${ip_to_delete} }"
+                            nft delete element inet ${F2B_TABLE_NAME} ${target_set} "{ ${ip_to_delete} }"
                             if [ $? -eq 0 ]; then ((deleted_count++)); else final_status=1; fi
                         fi
                     done
@@ -1203,10 +1196,8 @@ ssh_change_port() {
     
     local new_port
     while true; do
-        # --- 修正点 1: 更新输入提示 ---
         read -p "请输入新的SSH端口号 (1-65535, 'q'取消): " new_port
         
-        # --- 修正点 2: 增加取消判断 ---
         if [[ "$new_port" =~ ^[qQ]$ ]]; then
             echo -e "\n${YELLOW}操作已取消。${NC}"
             press_any_key
@@ -1296,6 +1287,7 @@ ssh_change_port() {
     press_any_key
 }
 
+# MODIFIED: Whitelist sets are now flushed from f2b-table.
 reset_fail2ban_data() {
     clear
     echo -e "${BLUE}--- 彻底重置 Fail2ban 所有数据 ---${NC}\n"
@@ -1330,21 +1322,20 @@ reset_fail2ban_data() {
     sleep 1
 
     echo -e "\n${YELLOW}2. 正在清理 Nftables 中的 Fail2ban 规则...${NC}"
-    local f2b_table_name="f2b-table"
-    if nft list table inet ${f2b_table_name} &>/dev/null; then
-        nft delete table inet ${f2b_table_name}
-        echo -e "${GREEN} -> 已成功删除 Nftables table: '${f2b_table_name}'。${NC}"
+    if nft list table inet ${F2B_TABLE_NAME} &>/dev/null; then
+        nft delete table inet ${F2B_TABLE_NAME}
+        echo -e "${GREEN} -> 已成功删除 Nftables table: '${F2B_TABLE_NAME}'。${NC}"
     else
-        echo -e "${CYAN} -> Nftables table '${f2b_table_name}' 不存在, 跳过。${NC}"
+        echo -e "${CYAN} -> Nftables table '${F2B_TABLE_NAME}' 不存在, 跳过。${NC}"
     fi
 
     echo -e "\n${YELLOW}3. 正在清空脚本创建的SSH优先白名单...${NC}"
-    if nft list set inet ${TABLE_NAME} ${F2B_SSH_WHITELIST_SET_V4} &>/dev/null; then
-        nft flush set inet ${TABLE_NAME} ${F2B_SSH_WHITELIST_SET_V4}
+    if nft list set inet ${F2B_TABLE_NAME} ${F2B_SSH_WHITELIST_SET_V4} &>/dev/null; then
+        nft flush set inet ${F2B_TABLE_NAME} ${F2B_SSH_WHITELIST_SET_V4}
         echo -e "${GREEN} -> 已清空 set: ${F2B_SSH_WHITELIST_SET_V4}${NC}"
     fi
-    if nft list set inet ${TABLE_NAME} ${F2B_SSH_WHITELIST_SET_V6} &>/dev/null; then
-        nft flush set inet ${TABLE_NAME} ${F2B_SSH_WHITELIST_SET_V6}
+    if nft list set inet ${F2B_TABLE_NAME} ${F2B_SSH_WHITELIST_SET_V6} &>/dev/null; then
+        nft flush set inet ${F2B_TABLE_NAME} ${F2B_SSH_WHITELIST_SET_V6}
         echo -e "${GREEN} -> 已清空 set: ${F2B_SSH_WHITELIST_SET_V6}${NC}"
     fi
     
@@ -1428,7 +1419,7 @@ toggle_ssh_defense_policy() {
 
         if [[ "$confirm" == "yes" ]]; then
             echo -e "\n${CYAN}  -> 正在确保SSH白名单规则存在...${NC}"
-            ensure_ssh_whitelist_rules_exist >/dev/null 2>&1
+            # ensure_ssh_whitelist_rules_exist is obsolete, but the logic below finds another anchor point
             
             local f2b_chain_handle=$(nft --handle list chain inet "$TABLE_NAME" "$INPUT_CHAIN" 2>/dev/null | grep 'f2b-chain' | awk '{print $NF}')
             local insertion_handle=""
@@ -1628,7 +1619,7 @@ fail2ban_ssh_manager_menu() {
         local defense_policy_status=$(get_ssh_defense_policy_status)
         local ipv6_ssh_status=$(get_ipv6_ssh_status)
         echo -e "${PURPLE}======================================================${NC}"
-        echo -e "                      ${CYAN}Fail2ban 与 SSH 综合管理中心${NC}"
+        echo -e "                          ${CYAN}Fail2ban 与 SSH 综合管理中心${NC}"
         echo -e "${PURPLE}======================================================${NC}"
         echo -e "${BLUE}--- Fail2ban 管理 ---${NC}"
         echo -e " ${GREEN}1.${NC} 查看服务状态与统计"
@@ -1640,7 +1631,7 @@ fail2ban_ssh_manager_menu() {
         echo -e " ${GREEN}7.${NC} ${YELLOW}更改 Fail2ban 核心参数${NC}"
         
         echo -e "\n${BLUE}--- SSH & 综合管理 ---${NC}"
-        echo -e " ${GREEN}8.${NC} ${CYAN}SSH 白名单管理 (优先于Fail2ban)${NC}"
+        echo -e " ${GREEN}8.${NC} ${CYAN}SSH 白名单管理 (内置于Fail2ban链)${NC}"
         echo -e " ${GREEN}9.${NC} ${RED}一键安全切换 SSH 端口${NC}"
         echo -e " ${GREEN}10.${NC} 切换SSH防御策略 ${defense_policy_status}"
         echo -e " ${GREEN}11.${NC} 切换IPv6 SSH状态 ${ipv6_ssh_status}"
@@ -2049,7 +2040,7 @@ socat_manager_menu() {
     while true; do
         clear
         echo -e "${PURPLE}======================================================${NC}"
-        echo -e "                     ${CYAN}轻量级端口转发 (Socat) 中心${NC}"
+        echo -e "                       ${CYAN}轻量级端口转发 (Socat) 中心${NC}"
         echo -e "${PURPLE}======================================================${NC}"
         echo -e "${YELLOW}此功能通过 systemd 管理 socat 进程, 实现持久化端口转发。${NC}"
         echo -e " ${GREEN}1.${NC} 添加新的转发规则"
@@ -2385,7 +2376,7 @@ main_menu() {
 
     clear
     echo -e "${PURPLE}======================================================${NC}"
-    echo -e "        ${CYAN}NFTables 防火墙管理器 (By Gemini v25.09.04)${NC}"
+    echo -e "        ${CYAN}NFTables 防火墙管理器 (By Gemini v25.09.05)${NC}"
     echo -e "${PURPLE}--------------------[ 系统状态 ]----------------------${NC}"
     echo -e " 入站策略: ${policy_input_color}${policy_input}${NC}  | 出站策略: ${YELLOW}${policy_output}${NC}  | 转发: ${forward_status}"
     echo -e " 开机自启: ${autostart_status} | Ping(IPv4): ${ipv4_ping_status} | SSH端口: ${ssh_port_info}"
