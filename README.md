@@ -6,7 +6,7 @@
 1.  **下载运行脚本**:
 ```bash
 wget https://raw.githubusercontent.com/cnnlei/sh/main/gost.sh
-sudo bash gost.sh
+bash gost.sh
 ```
 
 
@@ -20,7 +20,7 @@ sudo bash gost.sh
 
 ```bash
 wget https://raw.githubusercontent.com/cnnlei/sh/main/gost-mwss.sh
-sudo bash gost-mwss.sh
+bash gost-mwss.sh
 ```
 
 
@@ -33,7 +33,7 @@ sudo bash gost-mwss.sh
 
 ```bash
 wget https://raw.githubusercontent.com/cnnlei/sh/main/iptables.sh
-sudo bash iptables.sh
+bash iptables.sh
 ```
 
 
@@ -45,7 +45,19 @@ sudo bash iptables.sh
 
 ```bash
 wget https://raw.githubusercontent.com/cnnlei/sh/main/nftables.sh
-sudo bash nftables.sh
+bash nftables.sh
+```
+
+
+
+# docker多功能管理脚本
+## 一键运行
+
+请使用 `root` 用户或有 `sudo` 权限的用户，在终端中执行以下命令：
+
+```bash
+wget https://raw.githubusercontent.com/cnnlei/sh/main/docker.sh
+bash docker.sh
 ```
 
 
