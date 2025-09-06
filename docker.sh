@@ -1,16 +1,16 @@
 #!/bin/bash
 
 # ==============================================================================
-# Docker 容器交互式管理工具 v9.8 (功能修复)
+# Docker 容器交互式管理工具 v10.18 (jq 语法修复)
 #
-# v9.8 更新:
-# - 修复: “管理重启策略”功能因函数缺失而无法使用的问题，已补全该功能。
+# v10.18 更新:
+# - BUG修复: 修复了v10.17中因jq命令拼接错误(缺少+)导致主菜单
+#   无法正确显示容器详情并报错的问题。
 #
-# v9.7 更新:
-# - 修复: 修正了 v9.6 中未生效的主列表详情值（Policy, Ports, Mounts）紫色高亮功能。
-#
-# v9.6 更新:
-# - UI 优化: (失败的尝试) 为主列表中容器的 Policy, Ports, Mounts 等详情的值增加紫色高亮。
+# v10.17 更新:
+# - 列表排序: 主菜单实现了自定义排序(运行中>已停止>Compose)。
+# - UI优化: Compose容器在主菜单中不再带有可选序号，以防误操作。
+# - BUG修复: 彻底修复了普通容器被错误标记为[C]的问题。
 # ==============================================================================
 
 # --- 配置颜色输出 ---
@@ -19,6 +19,13 @@ if tput setaf 1 >&/dev/null; then
 else
     GREEN="\033[0;32m"; YELLOW="\033[1;33m"; RED="\033[0;31m"; CYAN="\033[0;36m"; BLUE="\033[0;34m"; MAGENTA="\033[0;35m"; WHITE="\033[1;37m"; RESET="\033[0m"
 fi
+
+# --- 全局变量 ---
+COMPOSE_CMD=""
+COMPOSE_DIRS_CONFIG_FILE="$HOME/.docker_manager_compose_dirs"
+# 创建YML时的默认目录
+DEFAULT_COMPOSE_CREATE_DIR="/root/docker-compose"
+
 
 # --- Helper 函数 ---
 log_success() { echo -e "${GREEN}[✓] $1${RESET}"; }
@@ -29,22 +36,164 @@ log_header() { echo -e "\n${CYAN}--- $1 ---${RESET}"; }
 command_exists() { command -v "$1" &> /dev/null; }
 press_enter_to_continue() { read -p "按 Enter 键继续..." ; }
 
+# 获取可用文本编辑器的函数
+get_editor() {
+    if [[ -n "$EDITOR" ]] && command_exists "$EDITOR"; then
+        echo "$EDITOR"
+    elif command_exists "nano"; then
+        echo "nano"
+    elif command_exists "vi"; then
+        echo "vi"
+    else
+        echo "" # 未找到任何编辑器
+    fi
+}
+
+
 # --- 依赖检查 ---
 check_dependencies() {
-    if command_exists jq; then return 0; fi
-    clear
-    log_info "高级功能需要 'jq' (JSON 解析器)。"
-    read -p "系统未检测到 jq, 是否需要自动为您安装? (y/N): " choice
-    if [[ ! "$choice" =~ ^[yY]$ ]]; then log_error "用户取消安装。部分功能可能无法正常显示。"; press_enter_to_continue; return 1; fi
-    
-    log_info "正在尝试安装 jq..."
-    if command_exists apt-get; then sudo apt-get update && sudo apt-get install -y jq;
-    elif command_exists yum; then sudo yum install -y jq;
-    elif command_exists dnf; then sudo dnf install -y jq;
-    else log_error "无法确定包管理器，请手动安装 jq。"; exit 1; fi
+    # 1. 检查 sudo
+    if ! command_exists sudo; then
+        clear
+        log_error "核心依赖 'sudo' 未找到。"
+        if [[ $EUID -eq 0 ]]; then
+            log_info "当前用户是 root，正在尝试为您安装 sudo..."
+            if command_exists apt-get; then apt-get update && apt-get install -y sudo;
+            elif command_exists yum; then yum install -y sudo;
+            elif command_exists dnf; then dnf install -y sudo;
+            else
+                log_error "无法确定包管理器，请手动安装 sudo 后再运行此脚本。"
+                exit 1
+            fi
+            if ! command_exists sudo; then
+                 log_error "sudo 安装失败，请手动安装。"
+                 exit 1
+            else
+                 log_success "sudo 安装成功！"
+                 press_enter_to_continue
+            fi
+        else
+            log_error "当前用户不是 root，且系统中没有 sudo。请联系系统管理员安装 sudo。"
+            exit 1
+        fi
+    fi
 
-    if command_exists jq; then log_success "jq 安装成功！"; press_enter_to_continue;
-    else log_error "jq 安装失败。"; exit 1; fi
+    # 2. 检查 jq
+    if ! command_exists jq; then
+        clear
+        log_info "高级功能需要 'jq' (JSON 解析器)。"
+        read -p "系统未检测到 jq, 是否需要自动为您安装? (y/N): " choice
+        if [[ "$choice" =~ ^[yY]$ ]]; then
+            log_info "正在尝试安装 jq..."
+            if command_exists apt-get; then sudo apt-get update && sudo apt-get install -y jq;
+            elif command_exists yum; then sudo yum install -y jq;
+            elif command_exists dnf; then sudo dnf install -y jq;
+            else log_error "无法确定包管理器，请手动安装 jq。"; fi
+
+            if command_exists jq; then log_success "jq 安装成功！";
+            else log_error "jq 安装失败。"; fi
+            press_enter_to_continue
+        else
+            log_error "用户取消安装。部分功能可能无法正常显示。"; press_enter_to_continue
+        fi
+    fi
+
+    # 3. 检查并设置 docker-compose 命令
+    if docker compose version &>/dev/null; then
+        COMPOSE_CMD="docker compose"
+    elif command_exists docker-compose; then
+        COMPOSE_CMD="docker-compose"
+    fi
+
+    if [[ -z "$COMPOSE_CMD" ]]; then
+        clear
+        log_info "推荐使用 'docker-compose' (或 Docker Compose V2 插件)。"
+        read -p "系统未检测到 docker-compose, 是否需要自动为您安装? (y/N): " choice
+        if [[ "$choice" =~ ^[yY]$ ]]; then
+            if ! command_exists curl; then
+                log_info "安装 docker-compose 需要 curl，正在尝试安装 curl..."
+                if command_exists apt-get; then sudo apt-get update && sudo apt-get install -y curl;
+                elif command_exists yum; then sudo yum install -y curl;
+                elif command_exists dnf; then sudo dnf install -y curl;
+                else log_error "无法安装 curl，请手动安装后再尝试。"; press_enter_to_continue; return; fi
+            fi
+
+            local installed_successfully=false
+            local kernel_name=$(uname -s | tr '[:upper:]' '[:lower:]')
+            local machine_arch=$(uname -m)
+            local asset_name="docker-compose-${kernel_name}-${machine_arch}"
+            local target_path="/usr/local/bin/docker-compose"
+
+            download_and_verify() {
+                local url=$1
+                if sudo curl -fL "$url" -o "$target_path"; then
+                    if file "$target_path" | grep -q "executable"; then
+                        return 0
+                    else
+                        log_error "下载的文件不是一个有效的可执行文件，已删除。"
+                        sudo rm -f "$target_path"
+                        return 1
+                    fi
+                else
+                    return 1
+                fi
+            }
+
+            log_info "正在从 GitHub 获取最新版本的 docker-compose (方法 1: API)..."
+            local LATEST_COMPOSE_URL
+            LATEST_COMPOSE_URL=$(curl -s https://api.github.com/repos/docker/compose/releases/latest | jq -r ".assets[] | select(.name == \"${asset_name}\") | .browser_download_url" 2>/dev/null)
+            
+            if [[ -n "$LATEST_COMPOSE_URL" ]]; then
+                log_info "已成功获取下载链接，准备下载..."
+                if download_and_verify "$LATEST_COMPOSE_URL"; then
+                    installed_successfully=true
+                else
+                    log_error "docker-compose 下载或验证失败 (方法 1)。"
+                fi
+            else
+                log_info "无法通过 API 获取直链 (方法 1 失败)。"
+            fi
+            
+            if [ "$installed_successfully" = false ]; then
+                log_info "正在尝试备用方法 (镜像代理)..."
+                local LATEST_TAG
+                LATEST_TAG=$(curl -s https://api.github.com/repos/docker/compose/releases/latest | jq -r .tag_name 2>/dev/null)
+                
+                if [[ -z "$LATEST_TAG" ]]; then
+                    log_error "无法从 GitHub API 获取最新版本号。"
+                else
+                    log_info "已获取最新版本号: ${LATEST_TAG}。"
+                    declare -a PROXY_URLS=(
+                        "https://mirror.ghproxy.com/"
+                        "https://ghproxy.net/"
+                    )
+                    
+                    for proxy in "${PROXY_URLS[@]}"; do
+                        local FALLBACK_URL="${proxy}https://github.com/docker/compose/releases/download/${LATEST_TAG}/${asset_name}"
+                        log_info "正在通过代理 '${proxy}' 下载..."
+                        if download_and_verify "$FALLBACK_URL"; then
+                            installed_successfully=true
+                            break
+                        else
+                            log_error "通过代理 '${proxy}' 下载失败。正在尝试下一个..."
+                        fi
+                    done
+                fi
+            fi
+
+            if [ "$installed_successfully" = true ]; then
+                sudo chmod +x "$target_path"
+                COMPOSE_CMD="/usr/local/bin/docker-compose"
+                log_success "docker-compose 安装成功！"
+                log_info "$($COMPOSE_CMD --version)"
+            else
+                log_error "所有自动安装方法均失败。请手动安装 docker-compose。"
+            fi
+            press_enter_to_continue
+        else
+            log_info "用户取消安装。相关功能将不可用。"; press_enter_to_continue
+        fi
+    fi
 }
 
 # --- 安装逻辑 ---
@@ -71,6 +220,388 @@ install_docker_if_needed() {
         log_error "Docker 安装失败。"; exit 1
     fi
 }
+
+# --- COMPOSE: Helper functions for directory management ---
+load_compose_dirs() {
+    if [[ ! -f "$COMPOSE_DIRS_CONFIG_FILE" ]]; then
+        touch "$COMPOSE_DIRS_CONFIG_FILE"
+    fi
+    mapfile -t compose_dirs < "$COMPOSE_DIRS_CONFIG_FILE"
+    # 过滤掉空行
+    compose_dirs=($(for dir in "${compose_dirs[@]}"; do echo "$dir"; done | grep .))
+}
+
+save_compose_dirs() {
+    printf "%s\n" "${compose_dirs[@]}" > "$COMPOSE_DIRS_CONFIG_FILE"
+}
+
+add_compose_dir() {
+    read -e -p "请输入包含 docker-compose yml 文件的目录的绝对路径: " new_dir
+    
+    # 移除路径末尾的斜杠
+    new_dir=${new_dir%/}
+
+    if [[ ! -d "$new_dir" ]]; then
+        log_error "错误: 目录 '$new_dir' 不存在。"
+        press_enter_to_continue
+        return
+    fi
+    
+    # 检查是否存在任何 docker-compose*.yml 或 compose*.yml 文件
+    if ! find "$new_dir" -maxdepth 1 -type f \( -name "docker-compose*.yml" -o -name "compose*.yml" \) -print -quit | grep -q .; then
+        log_error "错误: 在 '$new_dir' 中未找到任何 'compose*.yml' 或 'docker-compose*.yml' 文件。"
+        press_enter_to_continue
+        return
+    fi
+
+    # 检查目录是否已存在
+    for dir in "${compose_dirs[@]}"; do
+        if [[ "$dir" == "$new_dir" ]]; then
+            log_info "目录 '$new_dir' 已存在于列表中。"
+            press_enter_to_continue
+            return
+        fi
+    done
+
+    compose_dirs+=("$new_dir")
+    save_compose_dirs
+    log_success "目录 '$new_dir' 添加成功。"
+    press_enter_to_continue
+}
+
+delete_compose_dir() {
+    if [ ${#compose_dirs[@]} -eq 0 ]; then
+        log_info "没有可删除的目录。"
+        press_enter_to_continue
+        return
+    fi
+    
+    log_header "选择要删除的目录"
+    i=1
+    for dir in "${compose_dirs[@]}"; do
+        echo "  $i) $dir"
+        i=$((i+1))
+    done
+    echo "  q) 取消"
+    read -p "请输入序号: " choice
+
+    if [[ "$choice" =~ ^[0-9]+$ ]] && [ "$choice" -ge 1 ] && [ "$choice" -le ${#compose_dirs[@]} ]; then
+        local index_to_delete=$((choice-1))
+        local dir_to_delete=${compose_dirs[$index_to_delete]}
+        read -p "确定要从列表中删除 '$dir_to_delete' 吗? (y/N): " confirm
+        if [[ "$confirm" =~ ^[yY]$ ]]; then
+            unset 'compose_dirs[index_to_delete]'
+            # 重建数组以消除空位
+            compose_dirs=("${compose_dirs[@]}")
+            save_compose_dirs
+            log_success "目录已删除。"
+        else
+            log_info "已取消删除。"
+        fi
+    elif [[ "$choice" != "q" ]]; then
+        log_error "无效的序号。"
+    fi
+    press_enter_to_continue
+}
+
+# --- COMPOSE: YML 文件创建向导 ---
+create_compose_yml() {
+    clear
+    log_header "创建新的 Docker Compose 项目 (向导)"
+
+    # 1. 获取要创建新项目的父目录
+    local base_dir
+    read -e -p "请输入要创建新项目的【父目录】 [默认: ${DEFAULT_COMPOSE_CREATE_DIR}]: " base_dir
+    if [[ -z "$base_dir" ]]; then
+        base_dir="$DEFAULT_COMPOSE_CREATE_DIR"
+    fi
+    base_dir=${base_dir%/} # 移除末尾斜杠
+
+    # 确保父目录存在，如果不存在则询问是否创建
+    if [[ ! -d "$base_dir" ]]; then
+        read -p "父目录 '${base_dir}' 不存在, 是否要创建它? (y/N): " create_dir_confirm
+        if [[ "$create_dir_confirm" =~ ^[yY]$ ]]; then
+            if ! mkdir -p "$base_dir"; then
+                log_error "创建父目录 '${base_dir}' 失败。"
+                press_enter_to_continue
+                return
+            fi
+            log_success "父目录 '${base_dir}' 创建成功。"
+        else
+            log_info "操作已取消。"
+            press_enter_to_continue
+            return
+        fi
+    fi
+
+    # 2. 获取新项目的名称，这将作为目录名
+    local project_name
+    while true; do
+        read -p "请输入【新项目的名称】 (这将作为目录名, 如: my-app): " project_name
+        if [[ -z "$project_name" ]]; then
+            log_error "项目名称不能为空。"
+        elif [[ ! "$project_name" =~ ^[a-zA-Z0-9_-]+$ ]]; then
+            log_error "项目名称只能包含字母、数字、下划线(_)和连字符(-)。"
+        else
+            break
+        fi
+    done
+
+    # 3. 构建新的项目目录路径，并检查是否已存在
+    local project_dir_path="${base_dir}/${project_name}"
+    if [[ -d "$project_dir_path" ]]; then
+        log_error "错误: 项目目录 '${project_dir_path}' 已存在，请换一个项目名称。"
+        press_enter_to_continue
+        return
+    fi
+    
+    # 4. 创建新的项目目录
+    log_info "正在创建新项目目录: ${project_dir_path}"
+    if ! mkdir -p "$project_dir_path"; then
+        log_error "创建目录 '${project_dir_path}' 失败。"
+        press_enter_to_continue
+        return
+    fi
+
+    # 5. 在新目录中创建空的 docker-compose.yml 文件
+    local yml_file_path="${project_dir_path}/docker-compose.yml"
+    log_info "正在创建空的配置文件: ${yml_file_path}"
+    touch "$yml_file_path"
+
+    if [[ ! -f "$yml_file_path" ]]; then
+        log_error "文件创建失败！"
+        press_enter_to_continue
+        return
+    fi
+    log_success "文件 '${yml_file_path}' 创建成功！"
+
+
+    # 6. 自动将新的项目目录添加到管理列表
+    log_info "正在自动将新项目目录添加到管理列表..."
+    compose_dirs+=("$project_dir_path")
+    save_compose_dirs
+    log_success "目录 '${project_dir_path}' 已自动添加。"
+
+    # 7. 询问是否立即编辑
+    read -p "是否立即编辑新的 YML 文件? (Y/n): " edit_now_confirm
+    if [[ ! "$edit_now_confirm" =~ ^[nN]$ ]]; then
+        local editor
+        editor=$(get_editor)
+        if [[ -z "$editor" ]]; then
+            log_error "未找到可用的文本编辑器。请手动编辑文件: ${yml_file_path}"
+        else
+            log_info "将在 2 秒后使用 '${editor}' 打开文件..."
+            sleep 2
+            $editor "$yml_file_path"
+        fi
+    fi
+    press_enter_to_continue
+}
+
+# --- COMPOSE: 项目/目录操作菜单 ---
+manage_services_in_directory() {
+    # 函数现在直接接收一个文件路径
+    local compose_file=$1
+    local project_dir
+    project_dir=$(dirname "$compose_file") # 我们从文件路径获取目录
+
+    # 如果传入的文件名为空，则直接返回 (安全检查)
+    if [[ -z "$compose_file" ]]; then
+        log_error "无效的文件路径传入。"
+        press_enter_to_continue
+        return
+    fi
+
+    while true; do
+        clear
+        log_header "管理目录: ${BLUE}${project_dir}${RESET}"
+        log_info "使用配置文件: ${YELLOW}$(basename "$compose_file")${RESET}"
+        
+        log_info "正在获取服务状态..."
+        # 使用 docker compose ps -a 获取所有服务状态
+        local ps_output
+        ps_output=$($COMPOSE_CMD -f "$compose_file" ps -a --format '{{.Name}}\t{{.State}}\t{{.Ports}}')
+        
+        if [ -z "$ps_output" ]; then
+            log_info "此项目当前没有已创建的服务容器。"
+        else
+            printf "${WHITE}%-35s %-20s %s${RESET}\n" "服务 (CONTAINER NAME)" "状态 (STATE)" "端口 (PORTS)"
+            printf "${WHITE}%-35s %-20s %s${RESET}\n" "-----------------------------------" "--------------------" "--------------------"
+            while IFS= read -r line; do
+                IFS=$'\t' read -r name state ports <<< "$line"
+                local state_color=${RED}
+                if [[ "$state" == "running" ]]; then
+                    state_color=${GREEN}
+                elif [[ "$state" == "exited" ]]; then
+                    state_color=${YELLOW}
+                fi
+                printf "%-35s ${state_color}%-20s${RESET} %s\n" "$name" "$state" "$ports"
+            done <<< "$ps_output"
+        fi
+
+        echo "--------------------------------------------------"
+        echo -e "  1) ${GREEN}启动 / 应用配置 (up -d)${RESET}"
+        echo -e "  2) ${CYAN}更新镜像并重建 (pull & up)${RESET}"
+        echo -e "  3) ${YELLOW}停止服务 (stop)${RESET}"
+        echo -e "  4) ${YELLOW}重启服务 (restart)${RESET}"
+        echo -e "  5) ${RED}关闭并移除服务 (down)${RESET}"
+        echo -e "  6) ${BLUE}编辑 YML 并重建${RESET}"
+        echo -e "  7) ${GREEN}查看实时日志 (logs -f)${RESET}"
+        echo "--------------------------------------------------"
+        echo "  q) 返回目录列表"
+        echo "--------------------------------------------------"
+        read -p "请选择操作: " choice
+
+        case $choice in
+            1) log_info "正在启动服务或应用新配置..."; $COMPOSE_CMD -f "$compose_file" up -d; press_enter_to_continue;;
+            2)
+                log_info "此操作将拉取最新镜像并强制重建所有服务！"
+                read -p "确定要更新吗? (y/N): " confirm
+                if [[ "$confirm" =~ ^[yY]$ ]]; then
+                    log_info "正在为项目拉取最新镜像..."
+                    if $COMPOSE_CMD -f "$compose_file" pull; then
+                        log_info "镜像拉取成功，正在强制重建服务..."
+                        if $COMPOSE_CMD -f "$compose_file" up -d --force-recreate; then
+                            log_success "项目更新并重建成功！"
+                        else
+                            log_error "项目重建失败！"
+                        fi
+                    else
+                        log_error "镜像拉取失败，已中止操作。"
+                    fi
+                else
+                    log_info "已取消更新。"
+                fi
+                press_enter_to_continue
+                ;;
+            3) log_info "正在停止项目..."; $COMPOSE_CMD -f "$compose_file" stop; press_enter_to_continue;;
+            4) log_info "正在重启项目..."; $COMPOSE_CMD -f "$compose_file" restart; press_enter_to_continue;;
+            5) 
+                log_error "警告: 此操作将停止并移除项目的容器、网络！"
+                read -p "确定要关闭项目吗? (y/N): " confirm
+                if [[ "$confirm" =~ ^[yY]$ ]]; then
+                    log_info "正在关闭项目..."; $COMPOSE_CMD -f "$compose_file" down; log_success "项目已关闭。"
+                else
+                    log_info "已取消。"
+                fi
+                press_enter_to_continue
+                ;;
+            6)
+                local editor
+                editor=$(get_editor)
+                if [[ -z "$editor" ]]; then
+                    log_error "系统中未找到可用的文本编辑器 (如 nano 或 vi)。"
+                    press_enter_to_continue
+                    continue
+                fi
+
+                log_info "将在 3 秒后使用 '${editor}' 打开配置文件..."; sleep 3;
+                $editor "$compose_file"
+                log_info "配置文件已修改。"
+                read -p "是否立即使用新配置重建项目? (Y/n): " rebuild_confirm
+                if [[ ! "$rebuild_confirm" =~ ^[nN]$ ]]; then
+                    log_info "正在拉取新镜像并强制重建服务..."
+                    $COMPOSE_CMD -f "$compose_file" pull
+                    if $COMPOSE_CMD -f "$compose_file" up -d --build --force-recreate; then
+                        log_success "项目重建成功！"
+                    else
+                        log_error "项目重建失败！"
+                    fi
+                else
+                    log_info "已取消重建。"
+                fi
+                press_enter_to_continue
+                ;;
+            7) clear; log_header "实时日志: ${project_dir} (按 Ctrl+C 退出)"; $COMPOSE_CMD -f "$compose_file" logs -f --tail 100;;
+            [qQ]) return;;
+            *) log_error "无效选项。"; sleep 1;;
+        esac
+    done
+}
+
+# --- COMPOSE: 主管理菜单 ---
+manage_compose_projects() {
+    if [[ -z "$COMPOSE_CMD" ]]; then
+        log_error "系统中未找到 'docker compose' 或 'docker-compose' 命令。"
+        log_info "请先确保 Docker Compose 已正确安装。"
+        press_enter_to_continue
+        return
+    fi
+
+    declare -g -a compose_dirs=()
+    
+    while true; do
+        load_compose_dirs # 每次循环都重新加载以反映最新更改
+        clear
+        log_header "Docker Compose 项目管理"
+
+        # 创建一个所有可管理YML文件的扁平化列表
+        declare -a manageable_files=()
+        for dir in "${compose_dirs[@]}"; do
+            mapfile -t files_in_dir < <(find "$dir" -maxdepth 1 -type f \( -name "docker-compose*.yml" -o -name "compose*.yml" \) 2>/dev/null | sort)
+            for file in "${files_in_dir[@]}"; do
+                manageable_files+=("$file")
+            done
+        done
+
+        # --- 1. 显示所有找到的 YML 文件及其服务 ---
+        if [ ${#manageable_files[@]} -eq 0 ]; then
+            log_info "在已管理的目录中，尚未找到任何 Compose YML 文件。"
+        else
+            printf "${WHITE}%-4s %-60s %-s${RESET}\n" "NO." "Compose 文件路径" "服务状态"
+            printf "${WHITE}%-4s %-60s %-s${RESET}\n" "----" "------------------------------------------------------------" "--------------------"
+            i=1
+            for compose_file in "${manageable_files[@]}"; do
+                # 获取相对路径或父目录，让显示更友好
+                local display_path="${compose_file#$HOME/}"
+                display_path="~/$display_path"
+
+                printf "%-4s ${CYAN}%-60s${RESET}\n" "$i)" "$display_path"
+                
+                local ps_output
+                ps_output=$($COMPOSE_CMD -f "$compose_file" ps -a --format '{{.Name}}\t{{.State}}' 2>/dev/null)
+                
+                if [ -n "$ps_output" ]; then
+                    while IFS= read -r line; do
+                        IFS=$'\t' read -r name state <<< "$line"
+                        local state_color=${RED}
+                        if [[ "$state" == "running" ]]; then state_color=${GREEN}; elif [[ "$state" == "exited" ]]; then state_color=${YELLOW}; fi
+                        printf "     ${state_color}└─ %-40s (%s)${RESET}\n" "$name" "$state"
+                    done <<< "$ps_output"
+                else
+                     printf "     ${MAGENTA}└─ (服务未运行或未定义)${RESET}\n"
+                fi
+                i=$((i+1))
+            done
+        fi
+
+        # --- 2. 查找并显示未被管理的目录 (这部分逻辑保持不变) ---
+        # ... (这部分不需要修改，如果您愿意可以保持原样或删除)
+
+        # --- 3. 显示操作指令 ---
+        echo "--------------------------------------------------------------------------------"
+        echo "操作指令: a) 添加目录, d) 删除目录, c) 创建 YML, <数字> (管理), q (返回)"
+        echo "--------------------------------------------------------------------------------"
+        read -p "请输入操作或文件序号: " choice
+
+        case $choice in
+            [aA]) add_compose_dir;;
+            [dD]) delete_compose_dir;;
+            [cC]) create_compose_yml;;
+            [qQ]) return;;
+            *)
+                if [[ "$choice" =~ ^[0-9]+$ ]] && [ "$choice" -ge 1 ] && [ "$choice" -le ${#manageable_files[@]} ]; then
+                    selected_file=${manageable_files[$((choice-1))]}
+                    # 直接调用管理函数，传入文件路径
+                    manage_services_in_directory "$selected_file"
+                else
+                    log_error "无效输入。"; sleep 1
+                fi
+                ;;
+        esac
+    done
+}
+
 
 # --- 工具箱：修改 Docker 镜像源 ---
 set_docker_mirror() {
@@ -221,12 +752,11 @@ show_tools_menu() {
 }
 
 
-# --- (以下为其他未修改的函数，已折叠以保持简洁) ---
 # --- 镜像管理功能 ---
 manage_images() {
     while true; do
         clear; log_header "Docker 镜像管理"
-        mapfile -t images < <(docker images --format "{{.ID}}\t{{.Repository}}\t{{.Tag}}\t{{.Size}}")
+        mapfile -t images < <(docker images --format '{{.ID}}\t{{.Repository}}\t{{.Tag}}\t{{.Size}}')
         if [ ${#images[@]} -eq 0 ]; then log_info "系统中没有找到任何 Docker 镜像。"; else
             printf "${WHITE}%-4s %-18s %-40s %-15s %s${RESET}\n" "NO." "IMAGE ID" "REPOSITORY" "TAG" "SIZE"
             printf "${WHITE}%-4s %-18s %-40s %-15s %s${RESET}\n" "----" "------------------" "----------------------------------------" "---------------" "----"
@@ -293,7 +823,8 @@ update_container() {
         local retry_count=$(echo "$inspect_json" | jq -r '.[0].HostConfig.RestartPolicy.MaximumRetryCount')
         if [[ "$policy_name" == "on-failure" && "$retry_count" -gt 0 ]]; then run_cmd_args+=("--restart" "${policy_name}:${retry_count}"); else run_cmd_args+=("--restart" "$policy_name"); fi
     fi
-    mapfile -t ports < <(echo "$inspect_json" | jq -r '.[0].HostConfig.PortBindings | to_entries[] | "-p", "\(.value[0].HostPort):\(.key)"'); [ ${#ports[@]} -gt 0 ] && run_cmd_args+=("${ports[@]}")
+    mapfile -t ports < <(echo "$inspect_json" | jq -r '.[0].HostConfig.PortBindings | to_entries[] | "-p", ((if .value[0].HostIp and .value[0].HostIp != "" then .value[0].HostIp + ":" else "" end) + .value[0].HostPort + ":" + .key)')
+    [ ${#ports[@]} -gt 0 ] && run_cmd_args+=("${ports[@]}")
     mapfile -t mounts < <(echo "$inspect_json" | jq -r '.[0].Mounts[] | "-v", "\(.Source):\(.Destination)"'); [ ${#mounts[@]} -gt 0 ] && run_cmd_args+=("${mounts[@]}")
     mapfile -t envs < <(echo "$inspect_json" | jq -r '.[0].Config.Env[] | "-e", .'); [ ${#envs[@]} -gt 0 ] && run_cmd_args+=("${envs[@]}")
     run_cmd_args+=("$image_name"); log_info "将要执行以下命令:"
@@ -304,40 +835,107 @@ update_container() {
     if docker "${run_cmd_args[@]}"; then log_success "容器更新成功！新容器已启动。"; else log_error "容器更新失败。请检查上面的命令和错误信息。"; fi
     press_enter_to_continue; return 0
 }
+
+# --- 通用容器重建函数 ---
+recreate_container() {
+    local container_id=$1; shift
+    local container_name=$1; shift
+    local image_name=$1; shift
+    local restart_policy=$1; shift
+    
+    # 从管道符分隔的字符串中恢复数组
+    IFS='|' read -r -a ports <<< "$1"; shift
+    IFS='|' read -r -a volumes <<< "$1"; shift
+    IFS='|' read -r -a env_vars <<< "$1"; shift
+
+    local run_cmd_args=(); run_cmd_args+=("run" "-d" "--name" "$container_name")
+    
+    [[ -n "$restart_policy" && "$restart_policy" != "no" ]] && run_cmd_args+=("--restart" "$restart_policy")
+    
+    for port in "${ports[@]}"; do [[ -n "$port" ]] && run_cmd_args+=("-p" "$port"); done
+    for vol in "${volumes[@]}"; do [[ -n "$vol" ]] && run_cmd_args+=("-v" "$vol"); done
+    for env_var in "${env_vars[@]}"; do [[ -n "$env_var" ]] && run_cmd_args+=("-e" "$env_var"); done
+    
+    run_cmd_args+=("$image_name")
+    
+    clear; log_info "将根据您的配置执行以下命令:"
+    printf "docker "; for arg in "${run_cmd_args[@]}"; do if [[ "$arg" == *" "* ]]; then printf "'%s' " "$arg"; else printf "%s " "$arg"; fi; done; echo; echo
+    
+    read -p "确认执行以上命令吗? (Y/n): " final_confirm
+    if [[ "$final_confirm" =~ ^[nN]$ ]]; then log_info "已取消执行。"; press_enter_to_continue; return 1; fi
+    
+    log_info "正在停止旧容器..."; docker stop "$container_id" > /dev/null
+    log_info "正在删除旧容器..."; docker rm "$container_id" > /dev/null
+    log_info "正在创建并启动新容器..."
+    
+    if docker "${run_cmd_args[@]}"; then
+        log_success "容器编辑成功！新容器已启动。"
+    else
+        log_error "容器编辑失败。请检查上面的命令和错误信息。"
+    fi
+    press_enter_to_continue; return 0
+}
+
 # --- 容器编辑功能 (配置文件模式) ---
 edit_container_file() {
     local container_id=$1; local container_name=$2; local inspect_json=$3; local temp_file; temp_file=$(mktemp "/tmp/docker_edit_${container_name}.XXXXXX.conf"); trap 'rm -f "$temp_file"' RETURN
-    local image_name=$(echo "$inspect_json" | jq -r '.[0].Config.Image'); local restart_policy=$(echo "$inspect_json" | jq -r '.[0].HostConfig.RestartPolicy.Name // "no"')
-    local ports_array=$(echo "$inspect_json" | jq -r '.[0].HostConfig.PortBindings | to_entries | .[] | "\(.value[0].HostPort):\(.key)"' | sed 's/.*/  "&"/' | tr '\n' '\n')
-    local volumes_array=$(echo "$inspect_json" | jq -r '.[0].Mounts[] | "\(.Source):\(.Destination)"' | sed 's/.*/  "&"/' | tr '\n' '\n')
-    local env_vars_array=$(echo "$inspect_json" | jq -r '.[0].Config.Env[]' | sed 's/.*/  "&"/' | tr '\n' '\n')
+
+    # --- 1. 使用更简单、更健壮的格式生成配置文件 ---
+    # 直接使用jq生成 key="value" 格式的行
     cat > "$temp_file" <<-EOF
 # Edit Docker Container Configuration
 # Please modify the parameters below. Save and exit to apply changes.
-# Exiting without saving, or leaving the file empty, will cancel the operation.
+# For multiple ports, volumes, or envs, simply add more lines in the format key="value".
 # -----------------------------------------------------------------
-IMAGE_NAME="${image_name}"
-RESTART_POLICY="${restart_policy}"
-PORTS=(
-${ports_array}
-)
-VOLUMES=(
-${volumes_array}
-)
-ENV_VARS=(
-${env_vars_array}
-)
+image_name="$(echo "$inspect_json" | jq -r '.[0].Config.Image')"
+restart_policy="$(echo "$inspect_json" | jq -r '.[0].HostConfig.RestartPolicy.Name // "no"')"
+
+# --- Port Mappings (port="host:container") ---
+$(echo "$inspect_json" | jq -r '.[0].HostConfig.PortBindings | to_entries | .[] | "port=\"" + ((if .value[0].HostIp and .value[0].HostIp != "" then .value[0].HostIp + ":" else "" end) + .value[0].HostPort + ":" + .key) + "\""')
+
+# --- Volume Mappings (volume="/host:/container") ---
+$(echo "$inspect_json" | jq -r '.[0].Mounts[] | "volume=\"\(.Source):\(.Destination)\""')
+
+# --- Environment Variables (env_var="KEY=VALUE") ---
+$(echo "$inspect_json" | jq -r '.[0].Config.Env[] | "env_var=\"\(.)\""')
 EOF
-    local editor=${EDITOR:-vi}; if ! command_exists "$editor"; then editor=nano; fi; if ! command_exists "$editor"; then editor=vi; fi
+
+    local editor
+    editor=$(get_editor)
+    if [[ -z "$editor" ]]; then
+        log_error "系统中未找到可用的文本编辑器 (如 nano 或 vi)。"
+        press_enter_to_continue
+        return 1
+    fi
     log_info "将在 3 秒后使用 '${editor}' 打开配置文件..."; sleep 3; $editor "$temp_file"
     if [ ! -s "$temp_file" ]; then log_info "配置文件为空，操作已取消。"; press_enter_to_continue; return 1; fi
-    log_info "正在读取修改后的配置..."; unset IMAGE_NAME RESTART_POLICY PORTS VOLUMES ENV_VARS; source "$temp_file"
-    recreate_container_from_vars "$container_id" "$container_name"; return $?
+    
+    # --- 2. 使用更简单、更健壮的 grep 和 cut 来解析文件 ---
+    # 为防止意外，先读取文件内容并处理可能存在的CRLF(Windows换行符)问题
+    local file_content
+    file_content=$(tr -d '\r' < "$temp_file")
+
+    local new_image_name; new_image_name=$(echo "$file_content" | grep '^image_name=' | head -n 1 | cut -d'=' -f2- | sed 's/^"//;s/"$//')
+    local new_restart_policy; new_restart_policy=$(echo "$file_content" | grep '^restart_policy=' | head -n 1 | cut -d'=' -f2- | sed 's/^"//;s/"$//')
+    
+    mapfile -t new_ports < <(echo "$file_content" | grep '^port=' | cut -d'=' -f2- | sed 's/^"//;s/"$//')
+    mapfile -t new_volumes < <(echo "$file_content" | grep '^volume=' | cut -d'=' -f2- | sed 's/^"//;s/"$//')
+    mapfile -t new_env_vars < <(echo "$file_content" | grep '^env_var=' | cut -d'=' -f2- | sed 's/^"//;s/"$//')
+
+    # 将数组转换为管道符分隔的字符串以便传递
+    local ports_str; ports_str=$(printf "%s|" "${new_ports[@]}")
+    local volumes_str; volumes_str=$(printf "%s|" "${new_volumes[@]}")
+    local env_vars_str; env_vars_str=$(printf "%s|" "${new_env_vars[@]}")
+
+    recreate_container "$container_id" "$container_name" "$new_image_name" "$new_restart_policy" "$ports_str" "$volumes_str" "$env_vars_str"
+    return $?
 }
+
 # --- 容器编辑功能 (交互式向导模式) ---
 edit_container_interactive() {
     local container_id=$1; local container_name=$2; local inspect_json=$3; local image_name=$(echo "$inspect_json" | jq -r '.[0].Config.Image'); local restart_policy=$(echo "$inspect_json" | jq -r '.[0].HostConfig.RestartPolicy.Name // "no"')
-    mapfile -t ports < <(echo "$inspect_json" | jq -r '.[0].HostConfig.PortBindings | to_entries | .[] | "\(.value[0].HostPort):\(.key)"'); mapfile -t volumes < <(echo "$inspect_json" | jq -r '.[0].Mounts[] | "\(.Source):\(.Destination)"'); mapfile -t env_vars < <(echo "$inspect_json" | jq -r '.[0].Config.Env[]')
+    mapfile -t ports < <(echo "$inspect_json" | jq -r '.[0].HostConfig.PortBindings | to_entries | .[] | ((if .value[0].HostIp and .value[0].HostIp != "" then .value[0].HostIp + ":" else "" end) + .value[0].HostPort + ":" + .key)')
+    mapfile -t volumes < <(echo "$inspect_json" | jq -r '.[0].Mounts[] | "\(.Source):\(.Destination)"'); mapfile -t env_vars < <(echo "$inspect_json" | jq -r '.[0].Config.Env[]')
     while true; do
         clear; log_header "编辑向导: ${BLUE}${container_name}${RESET}"
         echo "当前配置:"; echo "  镜像: ${CYAN}${image_name}${RESET}"; echo "  重启策略: ${CYAN}${restart_policy}${RESET}"; echo "  端口映射: ${CYAN}${ports[*]}${RESET}"; echo "  目录映射: ${CYAN}${volumes[*]}${RESET}"; local env_count=${#env_vars[@]}; echo "  环境变量: ${CYAN}${env_count} 项${RESET}"
@@ -346,25 +944,27 @@ edit_container_interactive() {
             1) read -p "请输入新的重启策略 (no, on-failure, unless-stopped, always) [当前: ${restart_policy}]: " new_policy; if [ -n "$new_policy" ]; then restart_policy=$new_policy; fi;;
             2) read -p "请输入新的端口映射 (格式: 80:80 443:443) [当前: ${ports[*]}]: " -a new_ports; if [ ${#new_ports[@]} -gt 0 ]; then ports=("${new_ports[@]}"); fi;;
             3) read -p "请输入新的目录映射 (格式: /host:/app /data:/db) [当前: ${volumes[*]}]: " -a new_volumes; if [ ${#new_volumes[@]} -gt 0 ]; then volumes=("${new_volumes[@]}"); fi;;
-            4) local temp_env_file; temp_env_file=$(mktemp "/tmp/docker_edit_env_${container_name}.XXXXXX.env"); trap 'rm -f "$temp_env_file"' RETURN; printf "%s\n" "${env_vars[@]}" > "$temp_env_file"; local editor=${EDITOR:-vi}; if ! command_exists "$editor"; then editor=nano; fi; log_info "将使用 '${editor}' 打开环境变量文件..."; sleep 2; $editor "$temp_env_file"; mapfile -t env_vars < "$temp_env_file";;
-            [sS]) IMAGE_NAME=$image_name; RESTART_POLICY=$restart_policy; PORTS=("${ports[@]}"); VOLUMES=("${volumes[@]}"); ENV_VARS=("${env_vars[@]}"); recreate_container_from_vars "$container_id" "$container_name"; return $?;;
+            4) 
+                local temp_env_file; temp_env_file=$(mktemp "/tmp/docker_edit_env_${container_name}.XXXXXX.env"); trap 'rm -f "$temp_env_file"' RETURN; printf "%s\n" "${env_vars[@]}" > "$temp_env_file"
+                local editor
+                editor=$(get_editor)
+                if [[ -z "$editor" ]]; then
+                    log_error "系统中未找到可用的文本编辑器 (如 nano 或 vi)。"
+                    press_enter_to_continue
+                    continue
+                fi
+                log_info "将使用 '${editor}' 打开环境变量文件..."; sleep 2; $editor "$temp_env_file"; mapfile -t env_vars < "$temp_env_file";;
+            [sS])
+                # 将数组转换为管道符分隔的字符串以便传递
+                local ports_str; ports_str=$(printf "%s|" "${ports[@]}")
+                local volumes_str; volumes_str=$(printf "%s|" "${volumes[@]}")
+                local env_vars_str; env_vars_str=$(printf "%s|" "${env_vars[@]}")
+                recreate_container "$container_id" "$container_name" "$image_name" "$restart_policy" "$ports_str" "$volumes_str" "$env_vars_str"
+                return $?;;
             [qQ]) log_info "已放弃修改。"; press_enter_to_continue; return 1;;
             *) log_error "无效输入，请重试。"; sleep 1;;
         esac
     done
-}
-# --- 通用容器重建函数 ---
-recreate_container_from_vars() {
-    local container_id=$1; local container_name=$2; local run_cmd_args=(); run_cmd_args+=("run" "-d" "--name" "$container_name")
-    [[ -n "$RESTART_POLICY" && "$RESTART_POLICY" != "no" ]] && run_cmd_args+=("--restart" "$RESTART_POLICY")
-    for port in "${PORTS[@]}"; do run_cmd_args+=("-p" "$port"); done; for vol in "${VOLUMES[@]}"; do run_cmd_args+=("-v" "$vol"); done; for env_var in "${ENV_VARS[@]}"; do run_cmd_args+=("-e" "$env_var"); done
-    run_cmd_args+=("$IMAGE_NAME"); clear; log_info "将根据您的配置执行以下命令:"
-    printf "docker "; for arg in "${run_cmd_args[@]}"; do if [[ "$arg" == *" "* ]]; then printf "'%s' " "$arg"; else printf "%s " "$arg"; fi; done; echo; echo
-    read -p "确认执行以上命令吗? (Y/n): " final_confirm
-    if [[ "$final_confirm" =~ ^[nN]$ ]]; then log_info "已取消执行。"; press_enter_to_continue; return 1; fi
-    log_info "正在停止旧容器..."; docker stop "$container_id" > /dev/null; log_info "正在删除旧容器..."; docker rm "$container_id" > /dev/null; log_info "正在创建并启动新容器..."
-    if docker "${run_cmd_args[@]}"; then log_success "容器编辑成功！新容器已启动。"; else log_error "容器编辑失败。请检查上面的命令和错误信息。"; fi
-    press_enter_to_continue; return 0
 }
 
 # --- 管理重启策略 ---
@@ -416,7 +1016,7 @@ show_container_actions_menu() {
     while true; do
         clear; log_header "正在管理容器: ${BLUE}${container_name} (${container_id:0:12})${RESET}"
         local inspect_json; inspect_json=$(docker inspect "$container_id")
-        local raw_details; raw_details=$(echo "$inspect_json" | jq -r '.[0] | .State.Status + "\t" + (.State.Running | tostring) + "\t" + .State.StartedAt + "\t" + (.State.ExitCode | tostring) + "\t" + (.RepoTags[0] // .Config.Image // .Image) + "\t" + (.HostConfig.RestartPolicy.Name // "no") + "\t" + .Created + "\t" + (.HostConfig.PortBindings | if . == null or . == {} then "无" else (to_entries | map("\(.value[0].HostPort) -> \(.key)") | join("; ")) end) + "\t" + (.Mounts | if . == [] then "无" else (map("\(.Source) -> \(.Destination)") | join("; ")) end)')
+        local raw_details; raw_details=$(echo "$inspect_json" | jq -r '.[0] | .State.Status + "\t" + (.State.Running | tostring) + "\t" + .State.StartedAt + "\t" + (.State.ExitCode | tostring) + "\t" + (.RepoTags[0] // .Config.Image // .Image) + "\t" + (.HostConfig.RestartPolicy.Name // "no") + "\t" + .Created + "\t" + (.HostConfig.PortBindings | if . == null or . == {} then "无" else (to_entries | map((if .value[0].HostIp and .value[0].HostIp != "" then .value[0].HostIp + ":" else "" end) + .value[0].HostPort + " -> " + .key) | join("; ")) end) + "\t" + (.Mounts | if . == [] then "无" else (map("\(.Source) -> \(.Destination)") | join("; ")) end)')
         IFS=$'\t' read -r status is_running started_at exit_code image policy created_at ports mounts <<< "$raw_details"
         
         local status_line=""
@@ -427,10 +1027,9 @@ show_container_actions_menu() {
             status_line="状态 : ${RED}${status}${RESET} (exit code ${exit_code})"
         fi
 
-        # --- 直接打印详情，不再拼接字符串 (格式最终修复) ---
+        # --- 直接打印详情 ---
         echo -e "${WHITE}${status_line}${RESET}"
         
-        # 运行时间 (仅针对运行中的容器)
         if [[ "$is_running" == "true" ]]; then
             local current_ts=$(date +%s); local start_ts=$(date -d "$started_at" +%s); local diff_seconds=$((current_ts - start_ts)); local uptime_string=""
             local days=$((diff_seconds/86400)); local hours=$(((diff_seconds%86400)/3600)); local mins=$(((diff_seconds%3600)/60)); local secs=$((diff_seconds%60))
@@ -438,8 +1037,7 @@ show_container_actions_menu() {
             printf "%s: ${CYAN}%s${RESET}\n" "启动时间" "$uptime_string"
         fi
 
-        # 其他详情，使用全角空格 (　) 填充较短的标签以对齐冒号
-        printf "%s: ${CYAN}%s${RESET}\n" "镜像　　" "$image"
+        printf "%s: ${CYAN}%s${RESET}\n" "镜像    " "$image"
         printf "%s: ${CYAN}%s${RESET}\n" "重启策略" "$policy"
         printf "%s: ${CYAN}%s${RESET}\n" "创建时间" "$(date -d "$created_at" '+%Y-%m-%d %H:%M:%S')"
         printf "%s: ${CYAN}%s${RESET}\n" "端口映射" "$ports"
@@ -473,39 +1071,102 @@ show_container_actions_menu() {
     done
 }
 
-# --- 主程序 ---
+# --- 这是你要粘贴进去的【最终修复版】main_loop 函数 ---
 main_loop() {
     while true; do
         clear
         echo "============================================="
-        echo "      Docker 容器交互式管理工具 v9.8         "
+        echo "      Docker 容器交互式管理工具 v10.19       " # 版本号+0.01
         echo "============================================="
         
-        mapfile -t containers < <(docker ps -a --format "{{.ID}}\t{{.Names}}")
+        # --- 彻底重构的排序和显示逻辑 ---
         
-        if [ ${#containers[@]} -eq 0 ]; then
+        # 1. 获取根据规则排好序的容器ID列表
+        mapfile -t sorted_ids < <(docker ps -a --format '{{.ID}}\t{{.Label "com.docker.compose.project"}}\t{{.State}}' | while IFS=$'\t' read -r id compose_project state; do
+            local type_key
+            local state_key
+
+            # 设置类型码: 0=普通容器, 1=Compose容器
+            if [[ -n "$compose_project" ]]; then
+                type_key="1"
+            else
+                type_key="0"
+            fi
+
+            # 设置状态码: 0=运行中, 1=已停止
+            if [[ "$state" == "running" ]]; then
+                state_key="0"
+            else
+                state_key="1"
+            fi
+            
+            # 组合成最终排序码，格式为: 类型_状态
+            local sort_key="${type_key}_${state_key}"
+
+            printf "%s\t%s\n" "$sort_key" "$id"
+        done | sort -t $'\t' -k1,1 | cut -d $'\t' -f 2-)
+
+        # 2. 准备两个数组分别存放两种容器的ID
+        local selectable_container_ids=()
+        local compose_container_ids=()
+
+        # 3. 遍历排序后的ID，通过inspect获取准确信息并分离
+        for id in "${sorted_ids[@]}"; do
+            # 这里的 inspect 仅用于最终分类，排序已完成
+            local inspect_json
+            inspect_json=$(docker inspect "$id")
+            local compose_project
+            compose_project=$(echo "$inspect_json" | jq -r '.[0].Config.Labels["com.docker.compose.project"] // ""')
+
+            if [[ -n "$compose_project" && "$compose_project" != "null" ]]; then
+                compose_container_ids+=("$id")
+            else
+                selectable_container_ids+=("$id")
+            fi
+        done
+
+        if [ ${#sorted_ids[@]} -eq 0 ]; then
             log_info "系统中没有找到任何 Docker 容器。"
         else
             log_header "容器列表"
-            printf "${WHITE}%-4s %-22s %-40s %-s${RESET}\n" "NO." "NAME" "IMAGE" "STATUS"
-            printf "${WHITE}%-4s %-22s %-40s %-s${RESET}\n" "----" "----------------------" "----------------------------------------" "--------------------------"
+            printf "${WHITE}%-4s %-25s %-40s %-s${RESET}\n" "NO." "NAME" "IMAGE" "STATUS"
+            printf "${WHITE}%-4s %-25s %-40s %-s${RESET}\n" "----" "-------------------------" "----------------------------------------" "--------------------------"
             
-            i=1
-            for line in "${containers[@]}"; do
-                IFS=$'\t' read -r id name <<< "$line"; local details_json; details_json=$(docker inspect "$id")
-                local parsed_data; parsed_data=$(echo "$details_json" | jq -r '.[0] | (.RepoTags[0] // .Config.Image // .Image | sub(":latest$"; "")) + "\t" + (.State.Running|tostring) + "\t" + .State.StartedAt + "\t" + .State.FinishedAt + "\t" + (.State.ExitCode|tostring) + "\t" + (.HostConfig.RestartPolicy.Name // "no") + "\t" + (.HostConfig.PortBindings | if . == null or . == {} then "无" else (to_entries | map("\(.value[0].HostPort) -> \(.key)") | join(", ")) end) + "\t" + (.Mounts | if . == [] then "无" else (map((.Source | sub(env.HOME; "~")) + " -> " + .Destination) | join(", ")) end)')
+            # 用于显示详情的通用函数，避免代码重复
+            display_container_details() {
+                local container_id=$1
+                local prefix=$2
+
+                local details_json; details_json=$(docker inspect "$container_id")
+                local name; name=$(echo "$details_json" | jq -r '.[0].Name | sub("^/"; "")')
+                
+                local parsed_data; parsed_data=$(echo "$details_json" | jq -r '.[0] | (.RepoTags[0] // .Config.Image // .Image | sub(":latest$"; "")) + "\t" + (.State.Running|tostring) + "\t" + .State.StartedAt + "\t" + .State.FinishedAt + "\t" + (.State.ExitCode|tostring) + "\t" + (.HostConfig.RestartPolicy.Name // "no") + "\t" + (.HostConfig.PortBindings | if . == null or . == {} then "无" else (to_entries | map((if .value[0].HostIp and .value[0].HostIp != "" then .value[0].HostIp + ":" else "" end) + .value[0].HostPort + " -> " + .key) | join(", ")) end) + "\t" + (.Mounts | if . == [] then "无" else (map((.Source | sub(env.HOME; "~")) + " -> " + .Destination) | join(", ")) end)')
                 IFS=$'\t' read -r image is_running started_at finished_at exit_code policy ports mounts <<< "$parsed_data"
                 local status_string=""; if [[ "$is_running" == "true" ]]; then local start_time=$(date -d "$started_at" '+%m-%d %H:%M'); status_string="Up since ${start_time}"; else if [[ "$finished_at" != "0001-01-01"* ]]; then local finish_time=$(date -d "$finished_at" '+%m-%d %H:%M'); status_string="Exited(${exit_code}) at ${finish_time}"; else status_string="Created"; fi; fi
-                local truncated_name=$(printf "%.22s" "$name"); local truncated_image=$(printf "%.40s" "$image")
-                if [[ "$is_running" == "true" ]]; then printf "%-4s ${GREEN}%-22s${RESET} %-40s %s\n" "$i)" "$truncated_name" "$truncated_image" "$status_string"; else printf "%-4s ${RED}%-22s${RESET} %-40s %s\n" "$i)" "$truncated_name" "$truncated_image" "$status_string"; fi
+                
+                local name_display=$(printf "%.25s" "$name")
+                
+                local truncated_image=$(printf "%.40s" "$image")
+                if [[ "$is_running" == "true" ]]; then printf "%-4s ${GREEN}%-25s${RESET} %-40s %s\n" "$prefix" "$name_display" "$truncated_image" "$status_string"; else printf "%-4s ${RED}%-25s${RESET} %-40s %s\n" "$prefix" "$name_display" "$truncated_image" "$status_string"; fi
                 local truncated_ports=$(printf "%.30s" "$ports"); local truncated_mounts=$(printf "%.35s" "$mounts")
-                printf "    ${CYAN}-> Policy:${RESET} ${MAGENTA}%-15.15s${RESET} ${CYAN}-> Ports:${RESET} ${MAGENTA}%-30.30s${RESET} ${CYAN}-> Mounts:${RESET} ${MAGENTA}%s${RESET}\n" "$policy" "$truncated_ports" "$truncated_mounts"
+                printf "     ${CYAN}-> Policy:${RESET} ${MAGENTA}%-15.15s${RESET} ${CYAN}-> Ports:${RESET} ${MAGENTA}%-30.30s${RESET} ${CYAN}-> Mounts:${RESET} ${MAGENTA}%s${RESET}\n" "$policy" "$truncated_ports" "$truncated_mounts"
+            }
+
+            # 4. 先显示带序号的普通容器
+            i=1
+            for id in "${selectable_container_ids[@]}"; do
+                display_container_details "$id" "$i)"
                 i=$((i+1))
+            done
+
+            # 5. 再显示不带可选序号的Compose容器
+            for id in "${compose_container_ids[@]}"; do
+                display_container_details "$id" "${RED} C)${RESET}"
             done
         fi
         
         echo
-        log_info "输入 'image' 进入镜像管理, 'tools' (或回车) 进入工具箱, 'q' 退出"
+        log_info "输入 'image' 进入镜像管理, 'compose' 进入项目管理, 'tools' (或回车) 进入工具箱, 'q' 退出"
         local term_width=$(tput cols 2>/dev/null || echo 80); printf '%.0s─' $(seq 1 $term_width); echo
 
         read -p "请输入容器序号或指令: " choice
@@ -513,11 +1174,15 @@ main_loop() {
         case $choice in
             [qQ]) echo "感谢使用，脚本退出。"; break;;
             image) manage_images;;
+            compose) manage_compose_projects;;
             ""|tools) show_tools_menu;;
             *)
-                if [[ "$choice" =~ ^[0-9]+$ ]] && [ "$choice" -ge 1 ] && [ "$choice" -le ${#containers[@]} ]; then
-                    selected_line=${containers[$((choice-1))]}; IFS=$'\t' read -r container_id container_name <<< "$selected_line"
-                    show_container_actions_menu "$container_id" "$container_name"
+                if [[ "$choice" =~ ^[0-9]+$ ]] && [ "$choice" -ge 1 ] && [ "$choice" -le ${#selectable_container_ids[@]} ]; then
+                    # 从selectable_container_ids数组中安全地获取ID
+                    local selected_id=${selectable_container_ids[$((choice-1))]}
+                    local container_name
+                    container_name=$(docker inspect "$selected_id" | jq -r '.[0].Name | sub("^/"; "")')
+                    show_container_actions_menu "$selected_id" "$container_name"
                 else
                     if [ -n "$choice" ]; then log_error "无效输入，请输入列表中的数字或指令。"; press_enter_to_continue; fi
                 fi;;
@@ -526,6 +1191,6 @@ main_loop() {
 }
 
 # --- 脚本入口 ---
-install_docker_if_needed
 check_dependencies
+install_docker_if_needed
 main_loop
