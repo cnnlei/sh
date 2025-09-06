@@ -3,9 +3,9 @@
 #================================================================
 #
 #   文件: firewall.sh
-#   描述: Nftables 防火墙可视化管理脚本 (根据您的要求定制版)
-#   作者: Gemini & 您
-#   版本: 25.09.05 (Feat: 实现SSH白名单内置顶于Fail2ban链的方案)
+#   描述: Nftables 防火墙可视化管理脚本
+#   作者: cnyun.de
+#   版本: 1.0
 #
 #================================================================
 
@@ -370,23 +370,201 @@ add_rule_ip_based() { local direction=$1; local action=$2; local title=$3; local
 add_rule_port_based() { local direction=$1; local action=$2; local title=$3; local target_chain=""; local final_status=0; local ip_input="" ip_type="" is_set=false; local rule_type=""; if [[ "$direction" == "in" ]]; then if [[ "$action" == "accept" ]]; then target_chain="${USER_PORT_ALLOW}"; rule_type="add_allow"; else target_chain="${USER_PORT_BLOCK}"; rule_type="add_block"; fi; elif [[ "$direction" == "out" ]]; then target_chain="${USER_OUT_PORT_BLOCK}"; action="drop"; rule_type="add_block"; else echo -e "${RED}错误: 无效的规则方向。${NC}"; press_any_key; return; fi; clear; echo -e "${BLUE}--- ${title} ---${NC}\n"; while true; do echo -e "${CYAN}支持格式 - 单个:80, 多个:80,443, 范围:1000-2000${NC}"; read -p "请输入要操作的端口 (输入 'q' 返回): " port_input; if [[ $port_input =~ ^[qQ]$ ]]; then echo -e "\n${YELLOW}操作已取消。${NC}"; sleep 1; return; fi; formatted_ports=$(validate_and_format_ports "$port_input"); if [[ $? -eq 0 && -n "$formatted_ports" ]]; then break; else echo -e "${RED}输入无效或为空。${NC}"; fi; done; local ip_prop_text; [[ "$direction" == "in" ]] && ip_prop_text="来源" || ip_prop_text="目标"; echo -e "\n${CYAN}请选择此规则的IP${ip_prop_text}:${NC}"; echo " 1) 所有IP (默认)"; echo " 2) 指定单个IP/网段"; echo " 3) 从已有的IP集中选择"; local choice_ip_source; read -p "#? (默认: 1): " choice_ip_source; choice_ip_source=${choice_ip_source:-1}; case $choice_ip_source in 2) local prompt="请输入${ip_prop_text}IP地址或网段 ('q'返回): "; while true; do read -p "$prompt" ip_input; if [[ $ip_input =~ ^[qQ]$ ]]; then echo -e "\n${YELLOW}操作已取消。${NC}"; sleep 1; return; fi; ip_type=$(validate_ip_or_cidr "$ip_input"); if [[ "$ip_type" != "invalid" ]]; then break; else echo -e "${RED}IP地址格式错误。${NC}"; fi; done ;; 3) ip_input=$(select_from_ipset); if [ $? -ne 0 ]; then echo -e "\n${YELLOW}操作已取消。${NC}"; sleep 1; return; fi; is_set=true; if [[ "$ip_input" == *_v6 ]] || [[ "$ip_input" == *_V6 ]]; then ip_type="ipv6"; else ip_type="ipv4"; fi ;; *) ip_input="" ;; esac; local target_info; target_info=$(select_host_target "$ip_type" "$direction"); if [ $? -ne 0 ] || [[ -z "$target_info" ]]; then echo -e "\n${YELLOW}操作已取消。${NC}"; sleep 1; return; fi; local target_type=$(echo "$target_info" | cut -d: -f1); local target_value=$(echo "$target_info" | cut -d: -f2-); while true; do echo -e "\n${CYAN}请选择协议:${NC}"; echo -e " 1) All (TCP+UDP) (默认)"; echo -e " 2) TCP"; echo -e " 3) UDP"; echo -e " q) 返回"; read -p "#? (默认: 1. All): " choice; choice=${choice:-1}; case $choice in 1) protocols_to_add=("tcp" "udp"); protocol_desc="TCP+UDP"; break;; 2) protocols_to_add=("tcp"); protocol_desc="TCP"; break;; 3) protocols_to_add=("udp"); protocol_desc="UDP"; break;; [qQ]) echo -e "\n${YELLOW}操作已取消。${NC}"; sleep 1; return;; *) echo -e "${RED}无效选择。${NC}";; esac; done; read -p "请输入备注 (可选, 'q'取消): " comment; if [[ $comment =~ ^[qQ]$ ]]; then echo -e "\n${YELLOW}操作已取消。${NC}"; sleep 1; return; fi; local command_verb; if [[ "$action" == "accept" ]]; then command_verb="add"; else command_verb="insert"; fi; local entity_desc="${title} 端口:${port_input}"; if [[ -n "$ip_input" ]]; then entity_desc+=" (IP ${ip_prop_text}:${ip_input})"; fi; if [[ -n "$target_value" ]]; then entity_desc+=" -> ${target_type}:\"${target_value}\""; fi; entity_desc+=" [协议: ${protocol_desc}]"; for proto in "${protocols_to_add[@]}"; do local full_comment="${comment:-${action^}_Port_$(echo "$port_input" | sed 's/,/_/g')}_${proto}}"; local base_cmd_args=("nft" "${command_verb}" "rule" "inet" "${TABLE_NAME}" "${target_chain}"); if [[ -n "$target_value" ]]; then local host_ip_version=$(validate_ip_or_cidr "$target_value"); if [[ "$host_ip_version" == "ipv6" ]]; then base_cmd_args+=("ip6"); elif [[ "$host_ip_version" == "ipv4" ]]; then base_cmd_args+=("ip"); fi; base_cmd_args+=("$target_type" "\"$target_value\""); fi; if [[ -n "$ip_input" ]]; then local ip_prop; [[ "$direction" == "in" ]] && ip_prop="saddr" || ip_prop="daddr"; local ip_prefix; [[ "$ip_type" == "ipv6" ]] && ip_prefix="ip6" || ip_prefix="ip"; base_cmd_args+=("$ip_prefix" "$ip_prop"); if $is_set; then base_cmd_args+=("@$ip_input"); else base_cmd_args+=("$ip_input"); fi; fi; base_cmd_args+=("$proto" "dport" "$formatted_ports" "$action" "comment" "\"$full_comment\""); echo -e "${YELLOW}执行命令: ${base_cmd_args[*]}${NC}"; "${base_cmd_args[@]}"; if [ $? -ne 0 ]; then final_status=1; fi; done; apply_and_save_changes $final_status "$entity_desc" "true" "$rule_type" "$port_input"; }
 # [第二部分开始]
 
+# [请用这个修复了“错误字符”和“table名缺失”bug的最终版本，完整替换掉旧函数]
+edit_rule_interactive() {
+    local index=$1
+    local rule_text="${all_rules_text[$index]}"
+    local handle="${all_rules_handle[$index]}"
+    local chain="${all_rules_chain[$index]}"
+
+    # --- 第1步: 将现有规则解析成各个组件 ---
+    local saddr=$(echo "$rule_text" | grep -oP 'ip saddr \K[^ ]+|ip6 saddr \K[^ ]+' | sed 's/}//')
+    local daddr=$(echo "$rule_text" | grep -oP 'ip daddr \K[^ ]+|ip6 daddr \K[^ ]+' | sed 's/}//')
+    local iifname=$(echo "$rule_text" | grep -oP 'iifname \K"[^"]+"' | tr -d '"')
+    local oifname=$(echo "$rule_text" | grep -oP 'oifname \K"[^"]+"' | tr -d '"')
+    local protocol=$(echo "$rule_text" | grep -oP '(tcp|udp|icmp|icmpv6)(?= dport| sport| type| accept| drop| reject)')
+    local dport=$(echo "$rule_text" | grep -oP 'dport \K({ [^}]+ }|[^ ]+)' | sed 's/[{}]//g; s/ //g')
+    local sport=$(echo "$rule_text" | grep -oP 'sport \K({ [^}]+ }|[^ ]+)' | sed 's/[{}]//g; s/ //g')
+    local comment=$(echo "$rule_text" | grep -oP 'comment \K".*"' | tr -d '"')
+    local action=$(echo "$rule_text" | grep -oP '(accept|drop|reject)')
+
+    # --- 核心逻辑：严格根据链名称是否包含 "_OUT_" 来判断规则方向 ---
+    local direction="in"
+    if [[ "$chain" == *"_OUT_"* ]]; then
+        direction="out"
+    fi
+
+    while true; do
+        clear
+        echo -e "${BLUE}--- 交互式编辑规则 #${BASH_REMATCH[1]}$((index + 1)) ---${NC}"
+        echo -e "${CYAN}所属表/链:${NC} ${TABLE_NAME} / ${chain}"
+        echo -e "${CYAN}当前规则:${NC} $rule_text\n"
+        echo -e "${PURPLE}--- 请选择要编辑的项目 ---${NC}"
+
+        if [[ "$direction" == "in" ]]; then
+            # --- 入站规则菜单 (saddr=外部, daddr=本机) ---
+            echo -e " ${GREEN}1)${NC} 编辑外部源IP: ${YELLOW}${saddr:-Any}${NC}"
+            local local_target_in="${daddr:-${iifname}}"
+            echo -e " ${GREEN}2)${NC} 编辑本机目标: ${YELLOW}${local_target_in:-Any}${NC}"
+            local menu_offset=2
+            if [[ -n "$sport" ]]; then ((menu_offset++)); echo -e " ${GREEN}${menu_offset})${NC} 编辑源端口: ${YELLOW}${sport}${NC}"; fi
+            if [[ -n "$dport" ]]; then ((menu_offset++)); echo -e " ${GREEN}${menu_offset})${NC} 编辑目标端口: ${YELLOW}${dport}${NC}"; fi
+            ((menu_offset++)); echo -e " ${GREEN}${menu_offset})${NC} 编辑备注: ${YELLOW}${comment}${NC}"
+        else
+            # --- 出站规则菜单 (saddr=本机, daddr=外部) ---
+            local local_target_out="${saddr:-${oifname}}"
+            echo -e " ${GREEN}1)${NC} 编辑本机源: ${YELLOW}${local_target_out:-Any}${NC}"
+            echo -e " ${GREEN}2)${NC} 编辑外部目标IP: ${YELLOW}${daddr:-Any}${NC}"
+            local menu_offset=2
+            if [[ -n "$sport" ]]; then ((menu_offset++)); echo -e " ${GREEN}${menu_offset})${NC} 编辑源端口: ${YELLOW}${sport}${NC}"; fi
+            if [[ -n "$dport" ]]; then ((menu_offset++)); echo -e " ${GREEN}${menu_offset})${NC} 编辑目标端口: ${YELLOW}${dport}${NC}"; fi
+            ((menu_offset++)); echo -e " ${GREEN}${menu_offset})${NC} 编辑备注: ${YELLOW}${comment}${NC}"
+        fi
+
+        echo -e "\n ${GREEN}s) ${CYAN}保存并应用更改${NC}"
+        echo -e " ${GREEN}q) ${RED}放弃更改并返回${NC}"
+        echo -e "${PURPLE}-----------------------------${NC}"
+        read -p "请选择操作: " edit_choice
+
+        local operation=""
+        if [[ "$edit_choice" =~ ^[0-9]+$ ]]; then
+            # 重新编写选择逻辑，使其更健壮
+            local options_map=()
+            if [[ "$direction" == "in" ]]; then
+                options_map+=("外部IP")
+                options_map+=("本机IP/接口")
+                if [[ -n "$sport" ]]; then options_map+=("源端口"); fi
+                if [[ -n "$dport" ]]; then options_map+=("目标端口"); fi
+                options_map+=("备注")
+            else # out
+                options_map+=("本机IP/接口")
+                options_map+=("外部IP")
+                if [[ -n "$sport" ]]; then options_map+=("源端口"); fi
+                if [[ -n "$dport" ]]; then options_map+=("目标端口"); fi
+                options_map+=("备注")
+            fi
+            if [[ "$edit_choice" -ge 1 && "$edit_choice" -le ${#options_map[@]} ]]; then
+                operation="${options_map[$((edit_choice-1))]}"
+            fi
+        fi
+
+        case "$edit_choice" in
+            [1-9]*)
+                if [[ -z "$operation" ]]; then echo -e "${RED}无效选择。${NC}"; sleep 1; continue; fi
+
+                case "$operation" in
+                    "外部IP")
+                        local prompt_text=$([[ "$direction" == "in" ]] && echo "源" || echo "目标")
+                        echo -e "\n${CYAN}--- 正在编辑外部${prompt_text}IP (可以是IP, IP段, 或IP集) ---${NC}"
+                        echo "1) 手动输入新 IP/CIDR"; echo "2) 从 IP 集选择"
+                        read -p "请选择 (1-2): " type
+                        if [[ "$type" == "1" ]]; then
+                            read -p "请输入新的外部${prompt_text} IP/CIDR: " new_ip
+                            if [[ -n "$new_ip" && "$(validate_ip_or_cidr "$new_ip")" == "invalid" ]]; then echo -e "${RED}IP/CIDR 格式无效。${NC}"; sleep 2; continue; fi
+                            [[ "$direction" == "in" ]] && saddr=$new_ip || daddr=$new_ip
+                        elif [[ "$type" == "2" ]]; then
+                            new_ip_set=$(select_from_ipset)
+                            if [ $? -eq 0 ]; then [[ "$direction" == "in" ]] && saddr="@${new_ip_set}" || daddr="@${new_ip_set}"; fi
+                        fi
+                        ;;
+                    "本机IP/接口")
+                        local prompt_text=$([[ "$direction" == "in" ]] && echo "目标" || echo "源")
+                        echo -e "\n${CYAN}--- 正在编辑本机${prompt_text} (可以是本机IP或网卡) ---${NC}"
+                        local target_info=$(select_host_target "" "$direction")
+                        if [ $? -eq 0 ]; then
+                            if [[ "$direction" == "in" ]]; then daddr=""; iifname=""; else saddr=""; oifname=""; fi
+                            local target_type=$(echo "$target_info" | cut -d: -f1); local target_value=$(echo "$target_info" | cut -d: -f2-)
+                            if [[ "$target_type" == "daddr" ]]; then daddr=$target_value;
+                            elif [[ "$target_type" == "saddr" ]]; then saddr=$target_value;
+                            elif [[ "$target_type" == "iifname" ]]; then iifname=$target_value;
+                            elif [[ "$target_type" == "oifname" ]]; then oifname=$target_value;
+                            fi
+                        fi
+                        ;;
+                    "源端口"|"目标端口")
+                        local port_type=$([[ "$operation" == "源端口" ]] && echo "sport" || echo "dport")
+                        echo -e "\n${CYAN}--- 正在编辑${port_type} ---${NC}"
+                        read -p "请输入新端口 (单个:80, 多个:80,443, 范围:1000-2000): " new_port_input
+                        formatted_ports=$(validate_and_format_ports "$new_port_input")
+                        if [ $? -eq 0 ]; then
+                            if [[ "$port_type" == "sport" ]]; then sport=$(echo "$formatted_ports" | sed 's/[{}]//g; s/ //g');
+                            else dport=$(echo "$formatted_ports" | sed 's/[{}]//g; s/ //g'); fi
+                        else echo -e "${RED}${formatted_ports}${NC}"; sleep 2;
+                        fi
+                        ;;
+                    "备注")
+                        echo -e "\n${CYAN}--- 正在编辑备注 ---${NC}"; read -p "请输入新备注: " comment
+                        ;;
+                esac
+                ;;
+            s|S)
+                local cmd_str="nft replace rule inet ${TABLE_NAME} ${chain} handle ${handle}"
+                local remote_ip=$([[ "$direction" == "in" ]] && echo "$saddr" || echo "$daddr")
+                local local_ip=$([[ "$direction" == "in" ]] && echo "$daddr" || echo "$saddr")
+                local ip_prefix="ip"
+                if [[ "$(validate_ip_or_cidr "$remote_ip")" == "ipv6" || "$(validate_ip_or_cidr "$local_ip")" == "ipv6" ]]; then
+                    ip_prefix="ip6"
+                fi
+
+                if [[ "$direction" == "in" ]]; then
+                    if [[ -n "$iifname" ]]; then cmd_str+=" iifname \\\"$iifname\\\""; fi
+                    if [[ -n "$daddr" ]]; then cmd_str+=" $ip_prefix daddr $daddr"; fi
+                    if [[ -n "$saddr" ]]; then cmd_str+=" $ip_prefix saddr $saddr"; fi
+                else # out
+                    if [[ -n "$oifname" ]]; then cmd_str+=" oifname \\\"$oifname\\\""; fi
+                    if [[ -n "$saddr" ]]; then cmd_str+=" $ip_prefix saddr $saddr"; fi
+                    if [[ -n "$daddr" ]]; then cmd_str+=" $ip_prefix daddr $daddr"; fi
+                fi
+
+                if [[ -n "$protocol" ]]; then
+                    cmd_str+=" $protocol"
+                    if [[ -n "$sport" ]]; then cmd_str+=" sport $(validate_and_format_ports "$sport")"; fi
+                    if [[ -n "$dport" ]]; then cmd_str+=" dport $(validate_and_format_ports "$dport")"; fi
+                fi
+
+                cmd_str+=" $action comment \\\"$comment\\\""
+
+                echo -e "\n${YELLOW}准备执行替换命令...${NC}"; echo "$cmd_str"
+                read -p "确认应用以上更改吗? (Y/n): " confirm_apply
+                confirm_apply=${confirm_apply:-Y}
+                if [[ "$confirm_apply" =~ ^[yY]$ ]]; then
+                    if eval "$cmd_str"; then
+                        apply_and_save_changes 0 "编辑规则 #${BASH_REMATCH[1]}$((index + 1))" false
+                    else
+                        apply_and_save_changes 1 "编辑规则 #${BASH_REMATCH[1]}$((index + 1))" false
+                    fi
+                    return 0
+                else
+                    echo -e "${YELLOW}操作已取消。${NC}"; sleep 1
+                fi
+                ;;
+            q|Q)
+                echo -e "\n${YELLOW}已放弃所有更改。${NC}"; return 1
+                ;;
+            *)
+                echo -e "${RED}无效选择。${NC}"; sleep 1
+                ;;
+        esac
+    done
+}
+# [请用下面的代码替换掉您原有的整个同名函数]
 edit_delete_rule_visual() {
     local user_chains=("${USER_IP_WHITELIST}" "${USER_IP_BLACKLIST}" "${USER_PORT_BLOCK}" "${USER_PORT_ALLOW}" "${USER_OUT_IP_BLOCK}" "${USER_OUT_PORT_BLOCK}")
 
     while true; do
         clear
-        echo -e "${BLUE}--- 删除/排序 用户自定义规则 (终极修正版) ---${NC}\n"
+        echo -e "${BLUE}--- 删除/排序/编辑 用户自定义规则 (终极修正版) ---${NC}\n"
         local i=1
-        local all_rules_text=()
-        local all_rules_handle=()
-        local all_rules_chain=()
-        local all_rules_action=()
-        local all_rules_ports=()
+        # 在函数作用域内声明数组，以便其他函数可以访问
+        all_rules_text=()
+        all_rules_handle=()
+        all_rules_chain=()
+        all_rules_action=()
+        all_rules_ports=()
         declare -A chain_indices
 
         echo -e "${CYAN}当前可操作的所有用户规则 (已按优先级排序):${NC}"
         for chain_name in "${user_chains[@]}"; do
-            # 修正点: 先获取链中的所有行，然后过滤掉chain定义行，只保留纯粹的规则
             local all_lines_in_chain=()
             mapfile -t all_lines_in_chain < <(nft --handle list chain inet ${TABLE_NAME} "${chain_name}")
             
@@ -425,7 +603,7 @@ edit_delete_rule_visual() {
             echo -e "\n${YELLOW}没有用户添加的规则可供操作。${NC}"; press_any_key; break
         fi
 
-        echo -e "\n${CYAN}操作提示: 'd <编号>'(删除), 'm <编号>'(移动), 'da'(全删), 'q'(返回).${NC}"
+        echo -e "\n${CYAN}操作提示: 'd <编号>'(删除), 'm <编号>'(移动), 'e <编号>'(编辑), 'da'(全删), 'q'(返回).${NC}"
         read -p "请输入您的操作和编号: " action_input
 
         if [[ $action_input =~ ^[qQ]$ ]]; then break; fi
@@ -502,12 +680,12 @@ edit_delete_rule_visual() {
                 
                 echo -e "${PURPLE}--- 请选择移动方式 ---${NC}"
                 if [[ "$source_choice" -ne "$chain_start_idx" ]]; then
-                    echo -e " ${GREEN}t${NC}   - 置顶 (移至 #${chain_start_idx} 位置)"
-                    echo -e " ${GREEN}u${NC}   - 上移一位"
+                    echo -e " ${GREEN}t${NC}    - 置顶 (移至 #${chain_start_idx} 位置)"
+                    echo -e " ${GREEN}u${NC}    - 上移一位"
                 fi
                 if [[ "$source_choice" -ne "$chain_end_idx" ]]; then
-                    echo -e " ${GREEN}b${NC}   - 置底 (移至 #${chain_end_idx} 之后)"
-                    echo -e " ${GREEN}d${NC}   - 下移一位"
+                    echo -e " ${GREEN}b${NC}    - 置底 (移至 #${chain_end_idx} 之后)"
+                    echo -e " ${GREEN}d${NC}    - 下移一位"
                 fi
                 echo -e " ${GREEN}s <编号>${NC}  - 与规则 <编号> 交换位置"
                 echo -e " ${GREEN}bp <编号>${NC} - 移至规则 <编号> 之前 (Before Position)"
@@ -600,14 +778,28 @@ edit_delete_rule_visual() {
                     fi
                     apply_and_save_changes $final_status "$op_desc" false
                 elif [[ "$final_status" -eq -1 ]]; then
-                    :
+                    : # 没有执行任何操作，不做处理
                 else
                     echo -e "${RED}操作失败: 无法执行移动。${NC}"
                 fi
                 echo -e "${GREEN}操作完成, 正在刷新列表...${NC}"; sleep 1
                 ;;
+            e|edit) # <--- 编辑选项
+                read -ra choices <<< "$choices_str"
+                if [ ${#choices[@]} -ne 1 ]; then
+                    echo -e "\n${RED}错误: '编辑' 操作只需一个参数: 'e <要编辑的规则编号>'。${NC}"; sleep 2; continue
+                fi
+                local choice_to_edit=${choices[0]}
+                 if ! [[ "$choice_to_edit" =~ ^[0-9]+$ && "$choice_to_edit" -ge 1 && "$choice_to_edit" -le ${#all_rules_handle[@]} ]]; then
+                    echo -e "\n${RED}输入错误: '$choice_to_edit' 不是一个有效的编号。${NC}"; sleep 2; continue
+                fi
+                
+                edit_rule_interactive $((choice_to_edit-1))
+                # 不论编辑成功或取消，都刷新一下列表
+                echo -e "${GREEN}正在刷新列表...${NC}"; sleep 1
+                ;;
             *)
-                echo -e "\n${RED}无效操作。请输入 'd', 'm', 或 'da'。${NC}"
+                echo -e "\n${RED}无效操作。请输入 'd', 'm', 'e' 或 'da'。${NC}"
                 sleep 2
                 ;;
         esac
@@ -2376,7 +2568,7 @@ main_menu() {
 
     clear
     echo -e "${PURPLE}======================================================${NC}"
-    echo -e "        ${CYAN}NFTables 防火墙管理器 (By Gemini v25.09.05)${NC}"
+    echo -e "        ${CYAN}NFTables 防火墙管理器 (By cnyun.de v 1.0)${NC}"
     echo -e "${PURPLE}--------------------[ 系统状态 ]----------------------${NC}"
     echo -e " 入站策略: ${policy_input_color}${policy_input}${NC}  | 出站策略: ${YELLOW}${policy_output}${NC}  | 转发: ${forward_status}"
     echo -e " 开机自启: ${autostart_status} | Ping(IPv4): ${ipv4_ping_status} | SSH端口: ${ssh_port_info}"
@@ -2387,7 +2579,7 @@ main_menu() {
     echo -e " ${GREEN}3.${NC} ${YELLOW}新增 [入站端口封禁] 规则${NC}"
     echo -e " ${GREEN}4.${NC} 新增 [入站端口放行] 规则"
     echo -e " ${GREEN}5.${NC} IP 集管理 (国家/自定义)"
-    echo -e " ${GREEN}6.${NC} ${RED}删除/排序 用户规则 (终极灵活版)${NC}"
+    echo -e " ${GREEN}6.${NC} ${RED}查看/删除/编辑/排序 用户规则 (终极灵活版)${NC}"
     echo -e "\n${BLUE}--- 转发 & 出站 ---${NC}"
     echo -e " ${GREEN}7.${NC} ${YELLOW}新增 [出站IP/端口] 封锁${NC}"
     echo -e " ${GREEN}8.${NC} ${YELLOW}轻量级端口转发 (socat)${NC}"
