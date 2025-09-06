@@ -32,7 +32,7 @@ sudo bash gost-mwss.sh
 请使用 `root` 用户或有 `sudo` 权限的用户，在终端中执行以下命令：
 
 ```bash
-wget https://raw.githubusercontent.com/cnnlei/sh/main/safe.sh
+wget https://raw.githubusercontent.com/cnnlei/sh/main/iptables.sh
 sudo bash iptables.sh
 ```
 
@@ -44,7 +44,7 @@ sudo bash iptables.sh
 请使用 `root` 用户或有 `sudo` 权限的用户，在终端中执行以下命令：
 
 ```bash
-wget https://raw.githubusercontent.com/cnnlei/sh/main/safe.sh
+wget https://raw.githubusercontent.com/cnnlei/sh/main/nftables.sh
 sudo bash nftables.sh
 ```
 
