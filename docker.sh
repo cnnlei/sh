@@ -49,6 +49,121 @@ get_editor() {
     fi
 }
 
+# --- 请将下面两个函数添加到 Helper 函数区域 ---
+
+# --- 工具箱：安装快捷方式 ---
+install_shortcut() {
+    local SCRIPT_PATH
+    SCRIPT_PATH=$(readlink -f "$0") # 获取当前脚本的绝对路径
+    local SHORTCUT_PATH="/usr/local/bin/docker-mgr"
+
+    log_header "安装终端快捷方式 (docker-mgr)"
+    if [[ $EUID -ne 0 ]] && ! command_exists sudo; then
+        log_error "此操作需要 root 权限或 sudo。"
+        press_enter_to_continue
+        return
+    fi
+    
+    # 检查快捷方式是否已存在
+    if [ -e "$SHORTCUT_PATH" ]; then
+        # 如果已存在，检查它是否指向当前脚本
+        if [[ "$(readlink -f "$SHORTCUT_PATH")" == "$SCRIPT_PATH" ]]; then
+            log_success "快捷方式 'docker-mgr' 已安装，无需任何操作。"
+            press_enter_to_continue
+            return
+        else
+            read -p "快捷方式 'docker-mgr' 已存在但指向其他文件，是否覆盖? (y/N): " confirm
+            if [[ ! "$confirm" =~ ^[yY]$ ]]; then
+                log_info "已取消安装。"
+                press_enter_to_continue
+                return
+            fi
+        fi
+    fi
+    
+    log_info "正在创建符号链接并设置权限..."
+# 1. 创建或更新符号链接
+if sudo ln -sf "$SCRIPT_PATH" "$SHORTCUT_PATH"; then
+    # 2. 为原始脚本文件添加执行权限
+    if sudo chmod +x "$SCRIPT_PATH"; then
+        log_success "快捷方式 'docker-mgr' 安装/更新成功！"
+        log_info "现在您可以在任何地方直接使用 'docker-mgr' 命令了。"
+    else
+        log_error "快捷方式已创建，但为脚本添加执行权限失败。"
+    fi
+else
+    log_error "安装失败。请检查权限。"
+fi
+press_enter_to_continue
+}
+
+# --- 工具箱：卸载快捷方式 ---
+uninstall_shortcut() {
+    local SHORTCUT_PATH="/usr/local/bin/docker-mgr"
+    
+    log_header "卸载终端快捷方式 (docker-mgr)"
+    if [[ $EUID -ne 0 ]] && ! command_exists sudo; then
+        log_error "此操作需要 root 权限或 sudo。"
+        press_enter_to_continue
+        return
+    fi
+
+    if [ -L "$SHORTCUT_PATH" ]; then # 使用 -L 确保我们只删除符号链接
+        read -p "确定要卸载快捷方式 'docker-mgr' 吗? (y/N): " confirm
+        if [[ "$confirm" =~ ^[yY]$ ]]; then
+            log_info "正在删除符号链接: ${SHORTCUT_PATH}"
+            if sudo rm -f "$SHORTCUT_PATH"; then
+                log_success "快捷方式 'docker-mgr' 卸载成功。"
+            else
+                log_error "卸载失败。请检查权限。"
+            fi
+        else
+            log_info "已取消卸载。"
+        fi
+    else
+        log_info "快捷方式 'docker-mgr' 未安装或不是一个符号链接。"
+    fi
+    press_enter_to_continue
+}
+
+# --- 请将这个新菜单函数添加到 Helper 函数区域 ---
+
+# --- 工具箱：快捷方式管理菜单 ---
+manage_shortcut_menu() {
+    while true; do
+        clear
+        log_header "管理终端快捷方式 (docker-mgr)"
+
+        # 智能检测安装状态
+        local SCRIPT_PATH=$(readlink -f "$0")
+        local SHORTCUT_PATH="/usr/local/bin/docker-mgr"
+        local install_status_text
+        local install_status_color
+
+        if [[ -L "$SHORTCUT_PATH" && "$(readlink -f "$SHORTCUT_PATH")" == "$SCRIPT_PATH" ]]; then
+            install_status_color=${GREEN}
+            install_status_text="(已安装)"
+        else
+            install_status_color=${YELLOW}
+            install_status_text="(未安装)"
+        fi
+
+        echo -e "  1) ${install_status_color}安装 / 更新快捷方式 ${install_status_text}${RESET}"
+        echo "  2) 卸载快捷方式"
+        echo ""
+        echo "  q) 返回工具箱"
+        echo "-------------------------------------"
+        read -p "请选择功能: " choice
+
+        case $choice in
+            1) install_shortcut;;
+            2) uninstall_shortcut;;
+            [qQ]) return;;
+            *) log_error "无效选项。"; press_enter_to_continue;;
+        esac
+    done
+}
+
 
 # --- 依赖检查 ---
 check_dependencies() {
@@ -583,16 +698,32 @@ manage_services_in_directory() {
                 fi
                 
                 if [[ -n "$selected_service" ]]; then
-                    clear
-                    log_info "将尝试进入 '${selected_service}' 服务的容器..."
-                    log_info "将依次尝试 /bin/bash, /bin/sh"
-                    log_info "输入 'exit' 或按 Ctrl+D 退出容器"
-                    sleep 2
-                    $COMPOSE_CMD -f "$compose_file" exec "$selected_service" /bin/bash || $COMPOSE_CMD -f "$compose_file" exec "$selected_service" /bin/sh
-                else
-                    log_info "操作已取消。"
-                    sleep 1
-                fi
+    clear
+    log_info "已选定服务: '${YELLOW}${selected_service}${RESET}'"
+
+    local command_to_run
+    # 给出提示，让用户直接回车或输入自定义命令
+    read -e -p "请直接回车进入Shell(默认bash/sh)，或输入自定义命令: " command_to_run
+
+    if [[ -z "$command_to_run" ]]; then
+        # 用户直接回车，执行默认的、健壮的Shell进入逻辑
+        log_info "正在尝试进入 Shell (依次尝试 /bin/bash, /bin/sh)..."
+        log_info "输入 'exit' 或按 Ctrl+D 退出"
+        sleep 1
+        $COMPOSE_CMD -f "$compose_file" exec "$selected_service" /bin/bash || $COMPOSE_CMD -f "$compose_file" exec "$selected_service" /bin/sh
+    else
+        # 用户输入了自定义命令，直接执行
+        log_info "正在容器内执行自定义命令: '${CYAN}${command_to_run}${RESET}'..."
+        $COMPOSE_CMD -f "$compose_file" exec "$selected_service" ${command_to_run}
+    fi
+
+    # 为了防止非交互式命令（如 ls -l）的输出被立刻清屏，在这里暂停
+    press_enter_to_continue
+
+else
+    log_info "操作已取消。"
+    sleep 1
+fi
                 ;;
             # --- 逻辑结束 ---
             
@@ -605,7 +736,7 @@ manage_services_in_directory() {
     done
 }
 
-# --- 请用这个【修复了序号选择功能】的最终版，替换旧的 manage_compose_projects 函数 ---
+# --- 这是最终版 manage_compose_projects 函数，采用智能拦截方式处理自动发现项目 ---
 manage_compose_projects() {
     if [[ -z "$COMPOSE_CMD" ]]; then
         log_error "系统中未找到 'docker compose' 或 'docker-compose' 命令。"
@@ -621,26 +752,52 @@ manage_compose_projects() {
         clear
         log_header "Docker Compose 项目管理"
 
-        declare -a manageable_files=()
+        declare -a managed_files=()
         for dir in "${compose_dirs[@]}"; do
             mapfile -t files_in_dir < <(find "$dir" -maxdepth 1 -type f \( -name "docker-compose*.yml" -o -name "compose*.yml" \) 2>/dev/null | sort)
             for file in "${files_in_dir[@]}"; do
-                manageable_files+=("$file")
+                managed_files+=("$file")
             done
         done
 
-        if [ ${#manageable_files[@]} -eq 0 ]; then
-            log_info "在已管理的目录中，尚未找到任何 Compose YML 文件。"
+        declare -a discovered_files=()
+        mapfile -t discovered_files < <(docker ps -a --filter "label=com.docker.compose.project" --format '{{.Label "com.docker.compose.project.config_files"}}' | sort -u | grep .)
+
+        declare -a all_manageable_files=()
+        mapfile -t all_manageable_files < <( (printf "%s\n" "${managed_files[@]}"; printf "%s\n" "${discovered_files[@]}") | sort -u | grep . )
+
+
+        if [ ${#all_manageable_files[@]} -eq 0 ]; then
+            log_info "在已管理的目录中，且系统中，均未找到任何 Compose YML 文件或项目。"
         else
-            printf "${WHITE}%-4s %-s${RESET}\n" "NO." "Compose 项目"
-            printf "${WHITE}%-4s %-s${RESET}\n" "----" "--------------------------------------------------------------------------------"
+            printf "${WHITE}%-4s %-12s %-s${RESET}\n" "NO." "来源" "Compose 项目"
+            printf "${WHITE}%-4s %-12s %-s${RESET}\n" "----" "------------" "----------------------------------------------------------------------"
+            
             i=1
-            for compose_file in "${manageable_files[@]}"; do
+            for compose_file in "${all_manageable_files[@]}"; do
+                local project_dir=$(dirname "$compose_file")
+                local is_managed=false
+                for dir in "${compose_dirs[@]}"; do
+                    if [[ "$dir" == "$project_dir" ]]; then
+                        is_managed=true
+                        break
+                    fi
+                done
+
+                local source_tag=""
+                if [[ "$is_managed" = true ]]; then
+                    source_tag="${GREEN}[已管理]${RESET}"
+                else
+                    source_tag="${YELLOW}[自动发现]${RESET}"
+                fi
+                
                 local display_path="${compose_file#$HOME/}"
                 display_path="~/$display_path"
 
-                printf "\n%-4s ${CYAN}%s${RESET}\n" "$i)" "$display_path"
+                # 恢复所有项目的序号显示
+                printf "\n%-4s %-12b %s\n" "$i)" "${source_tag}" "${CYAN}${display_path}${RESET}"
                 
+                # ... (后续显示服务列表的逻辑完全不变) ...
                 unset container_states
                 declare -A container_states
                 local ps_output
@@ -659,39 +816,32 @@ manage_compose_projects() {
                 local config_json
                 config_json=$($COMPOSE_CMD -f "$compose_file" config --format json 2>/dev/null)
                 if [ -z "$config_json" ]; then
-                    printf "     ${RED}%s${RESET}\n" "├─ (无法解析配置文件)"
+                    printf "      ${RED}%s${RESET}\n" "├─ (无法解析配置文件)"
                     i=$((i+1))
                     continue
                 fi
                 mapfile -t defined_services < <(echo "$config_json" | jq -r '.services | keys[]' | grep .)
-
                 if [ ${#defined_services[@]} -eq 0 ]; then
-                     printf "     ${MAGENTA}%s${RESET}\n" "├─ (文件中未定义服务)"
+                        printf "      ${MAGENTA}%s${RESET}\n" "├─ (文件中未定义服务)"
                 else
-                    printf "     ${WHITE}%-35s %-22s %s${RESET}\n" "  服务名称" "运行状态" "详情 / 时长"
-                    printf "     ${WHITE}%-35s %-22s %s${RESET}\n" "  ---------------------------------" "----------------------" "--------------------"
-                    local running_list=()
-                    local exited_list=()
-                    local not_created_list=()
-
+                    printf "      ${WHITE}%-35s %-22s %s${RESET}\n" "  服务名称" "运行状态" "详情 / 时长"
+                    printf "      ${WHITE}%-35s %-22s %s${RESET}\n" "  ---------------------------------" "----------------------" "--------------------"
+                    local running_list=(); local exited_list=(); local not_created_list=()
                     for service_name in "${defined_services[@]}"; do
                         local display_name="├─ $service_name"
                         if [[ -v "container_states[$service_name]" ]]; then
-                            local state_json=${container_states[$service_name]}
-                            local is_running=$(echo "$state_json" | jq -r '.Running')
-                            
+                            local state_json=${container_states[$service_name]}; local is_running=$(echo "$state_json" | jq -r '.Running')
                             if [[ "$is_running" == "true" ]]; then
                                 local started_at=$(echo "$state_json" | jq -r '.StartedAt'); local uptime_string=""; local current_ts=$(date +%s); local start_ts=$(date -d "$started_at" +%s); local diff_seconds=$((current_ts - start_ts)); local days=$((diff_seconds/86400)); local hours=$(((diff_seconds%86400)/3600)); local mins=$(((diff_seconds%3600)/60)); local secs=$((diff_seconds%60)); if (( days > 0 )); then uptime_string="${days} 天 ${hours} 小时前"; elif (( hours > 0 )); then uptime_string="${hours} 小时 ${mins} 分钟前"; elif (( mins > 0 )); then uptime_string="${mins} 分钟 ${secs} 秒前"; else uptime_string="${secs} 秒前"; fi
-                                running_list+=("$(printf "     ${GREEN}%-35s %-22s %s${RESET}" "$display_name" "(正在运行)" "$uptime_string")")
+                                running_list+=("$(printf "      ${GREEN}%-35s %-22s %s${RESET}" "$display_name" "(正在运行)" "$uptime_string")")
                             else
-                                exited_list+=("$(printf "     ${RED}%-35s %-22s${RESET}" "$display_name" "(已创建 / 未运行)")")
+                                exited_list+=("$(printf "      ${RED}%-35s %-22s${RESET}" "$display_name" "(已创建 / 未运行)")")
                             fi
                         else
                             local image_name=$(echo "$config_json" | jq -r --arg srv "$service_name" '.services[$srv].image // "镜像未指定"')
-                            not_created_list+=("$(printf "     ${GRAY}%-35s %-22s ${WHITE}%s${RESET}" "$display_name" "(未创建)" "Image: $image_name")")
+                            not_created_list+=("$(printf "      ${GRAY}%-35s %-22s ${WHITE}%s${RESET}" "$display_name" "(未创建)" "Image: $image_name")")
                         fi
                     done
-
                     for item in "${running_list[@]}"; do echo -e "$item"; done
                     for item in "${exited_list[@]}"; do echo -e "$item"; done
                     for item in "${not_created_list[@]}"; do echo -e "$item"; done
@@ -701,7 +851,7 @@ manage_compose_projects() {
         fi
 
         echo "--------------------------------------------------------------------------------"
-        echo "操作指令: a) 添加目录, d) 删除目录, c) 创建 YML, <数字> (管理), q (返回)"
+        echo "操作指令: a)添加, d)删除, c)创建, m <序号|all>(添加), <已管理项序号>(进入), q(返回)"
         echo "--------------------------------------------------------------------------------"
         read -p "请输入操作或文件序号: " choice
 
@@ -710,13 +860,47 @@ manage_compose_projects() {
             [dD]) delete_compose_dir;;
             [cC]) create_compose_yml;;
             [qQ]) return;;
-            *)
-                # --- 核心修改：修正正则表达式的拼写错误 ---
-                if [[ "$choice" =~ ^[0-9]+$ ]] && [ "$choice" -ge 1 ] && [ "$choice" -le ${#manageable_files[@]} ]; then
-                    selected_file=${manageable_files[$((choice-1))]}
-                    manage_services_in_directory "$selected_file"
+            [mM]*)
+                local arg_str=${choice#[mM]}; arg_str=$(echo "$arg_str" | xargs)
+                declare -a target_indices=(); declare -a invalid_inputs=()
+                if [[ "$arg_str" == "all" ]]; then
+                    for i in "${!all_manageable_files[@]}"; do target_indices+=($((i + 1))); done
                 else
-                    log_error "无效输入。"; sleep 1
+                    local indices_str=${arg_str//,/ }; for num in $indices_str; do if [[ "$num" =~ ^[0-9]+$ ]]; then target_indices+=("$num"); else [[ -n "$num" ]] && invalid_inputs+=("$num"); fi; done
+                fi
+                declare -a dirs_to_add=();
+                for num in "${target_indices[@]}"; do if [ "$num" -ge 1 ] && [ "$num" -le ${#all_manageable_files[@]} ]; then local file_path=${all_manageable_files[$((num-1))]}; dirs_to_add+=("$(dirname "$file_path")"); else invalid_inputs+=("$num"); fi; done
+                declare -a unique_new_dirs=();
+                if [ ${#dirs_to_add[@]} -gt 0 ]; then mapfile -t unique_new_dirs < <({ printf "%s\n" "${dirs_to_add[@]}"; printf "%s\n" "${compose_dirs[@]}"; } | sort | uniq -u); fi
+                if [ ${#unique_new_dirs[@]} -gt 0 ]; then
+                    compose_dirs+=("${unique_new_dirs[@]}"); save_compose_dirs
+                    log_success "已成功添加以下目录至管理列表:"; for d in "${unique_new_dirs[@]}"; do echo -e "  ${GREEN}- $d${RESET}"; done
+                else
+                    log_info "没有新的、未被管理的目录可供添加。"
+                fi
+                if [ ${#invalid_inputs[@]} -gt 0 ]; then log_error "以下输入无效: ${invalid_inputs[*]}"; fi
+                press_enter_to_continue
+                ;;
+            *)
+                if [[ "$choice" =~ ^[0-9]+$ ]] && [ "$choice" -ge 1 ] && [ "$choice" -le ${#all_manageable_files[@]} ]; then
+                    local selected_file=${all_manageable_files[$((choice-1))]}
+                    
+                    # --- 核心改动：在这里进行智能判断 ---
+                    local project_dir=$(dirname "$selected_file")
+                    local is_managed=false
+                    for dir in "${compose_dirs[@]}"; do if [[ "$dir" == "$project_dir" ]]; then is_managed=true; break; fi; done
+
+                    if [[ "$is_managed" == true ]]; then
+                        # 如果是已管理项目，则进入
+                        manage_services_in_directory "$selected_file"
+                    else
+                        # 如果是自动发现项目，则拦截并提示
+                        log_error "此为自动发现项目，无法直接管理。"
+                        log_info "请先使用 '${YELLOW}m ${choice}${RESET}' 命令将其目录添加至管理列表。"
+                        press_enter_to_continue
+                    fi
+                else
+                    log_error "无效输入或序号。"; sleep 1
                 fi
                 ;;
         esac
@@ -850,14 +1034,30 @@ prune_docker_system() {
 }
 
 
-# --- 工具箱主菜单 ---
+# --- 请用这个新版本替换旧的 show_tools_menu 函数 ---
 show_tools_menu() {
     while true; do
         clear
         log_header "实用工具箱"
+        
+        # --- 新增：动态检测快捷方式状态 ---
+        local SCRIPT_PATH=$(readlink -f "$0")
+        local SHORTCUT_PATH="/usr/local/bin/docker-mgr"
+        local shortcut_status_text
+        local shortcut_status_color
+
+        if [[ -L "$SHORTCUT_PATH" && "$(readlink -f "$SHORTCUT_PATH")" == "$SCRIPT_PATH" ]]; then
+            shortcut_status_color=${GREEN}
+            shortcut_status_text="(已安装)"
+        else
+            shortcut_status_color=${YELLOW}
+            shortcut_status_text="(未安装)"
+        fi
+        # --- 状态检测结束 ---
+
         echo "  1) 修改 Docker Hub 镜像加速源"
         echo "  2) 清理 Docker 系统 (prune)"
-        echo "  ... 更多功能待定 ..."
+        echo -e "  3) ${shortcut_status_color}管理终端快捷方式 (docker-mgr) ${shortcut_status_text}${RESET}"
         echo ""
         echo "  q) 返回主菜单"
         echo "-------------------------------------"
@@ -866,6 +1066,7 @@ show_tools_menu() {
         case $choice in
             1) set_docker_mirror;;
             2) prune_docker_system;;
+            3) manage_shortcut_menu;; # 调用新的管理菜单
             [qQ]) return;;
             *) log_error "无效选项。"; press_enter_to_continue;;
         esac
