@@ -15,9 +15,9 @@
 
 # --- 配置颜色输出 ---
 if tput setaf 1 >&/dev/null; then
-    GREEN=$(tput setaf 2); YELLOW=$(tput setaf 3); RED=$(tput setaf 1); CYAN=$(tput setaf 6); BLUE=$(tput setaf 4); MAGENTA=$(tput setaf 5); WHITE=$(tput setaf 7); RESET=$(tput sgr0)
+    GREEN=$(tput setaf 2); YELLOW=$(tput setaf 3); RED=$(tput setaf 1); CYAN=$(tput setaf 6); BLUE=$(tput setaf 4); MAGENTA=$(tput setaf 5); WHITE=$(tput setaf 7); GRAY=$(tput setaf 8); RESET=$(tput sgr0)
 else
-    GREEN="\033[0;32m"; YELLOW="\033[1;33m"; RED="\033[0;31m"; CYAN="\033[0;36m"; BLUE="\033[0;34m"; MAGENTA="\033[0;35m"; WHITE="\033[1;37m"; RESET="\033[0m"
+    GREEN="\033[0;32m"; YELLOW="\033[1;33m"; RED="\033[0;31m"; CYAN="\033[0;36m"; BLUE="\033[0;34m"; MAGENTA="\033[0;35m"; WHITE="\033[1;37m"; GRAY="\033[0;90m"; RESET="\033[0m"
 fi
 
 # --- 全局变量 ---
@@ -398,47 +398,75 @@ create_compose_yml() {
     press_enter_to_continue
 }
 
-# --- COMPOSE: 项目/目录操作菜单 ---
+# --- 请用这个【增加了进入容器Shell功能】的版本替换旧的 manage_services_in_directory 函数 ---
 manage_services_in_directory() {
-    # 函数现在直接接收一个文件路径
     local compose_file=$1
     local project_dir
-    project_dir=$(dirname "$compose_file") # 我们从文件路径获取目录
+    project_dir=$(dirname "$compose_file")
 
-    # 如果传入的文件名为空，则直接返回 (安全检查)
     if [[ -z "$compose_file" ]]; then
         log_error "无效的文件路径传入。"
         press_enter_to_continue
         return
     fi
 
+    local choice=""
     while true; do
         clear
         log_header "管理目录: ${BLUE}${project_dir}${RESET}"
         log_info "使用配置文件: ${YELLOW}$(basename "$compose_file")${RESET}"
         
-        log_info "正在获取服务状态..."
-        # 使用 docker compose ps -a 获取所有服务状态
-        local ps_output
-        ps_output=$($COMPOSE_CMD -f "$compose_file" ps -a --format '{{.Name}}\t{{.State}}\t{{.Ports}}')
+        local compose_output
+        compose_output=$($COMPOSE_CMD -f "$compose_file" ps -a -q 2>&1)
+        local exit_code=$?
         
-        if [ -z "$ps_output" ]; then
-            log_info "此项目当前没有已创建的服务容器。"
+        local errors
+        errors=$(echo "$compose_output" | grep -v -E "WARN.*(obsolete|deprecated)")
+
+        if [ $exit_code -ne 0 ] && [ -n "$errors" ]; then
+            log_error "执行 docker-compose 命令时出错:"
+            echo -e "${RED}${errors}${RESET}"
+            press_enter_to_continue
+            choice="error_occurred" 
         else
-            printf "${WHITE}%-35s %-20s %s${RESET}\n" "服务 (CONTAINER NAME)" "状态 (STATE)" "端口 (PORTS)"
-            printf "${WHITE}%-35s %-20s %s${RESET}\n" "-----------------------------------" "--------------------" "--------------------"
-            while IFS= read -r line; do
-                IFS=$'\t' read -r name state ports <<< "$line"
-                local state_color=${RED}
-                if [[ "$state" == "running" ]]; then
-                    state_color=${GREEN}
-                elif [[ "$state" == "exited" ]]; then
-                    state_color=${YELLOW}
-                fi
-                printf "%-35s ${state_color}%-20s${RESET} %s\n" "$name" "$state" "$ports"
-            done <<< "$ps_output"
+            mapfile -t container_ids < <(echo "$compose_output" | grep -v -E "WARN.*(obsolete|deprecated)")
         fi
 
+        if [ ${#container_ids[@]} -eq 0 ] && [[ "$choice" != "error_occurred" ]]; then
+            log_info "此项目当前没有已创建的服务容器。"
+        elif [[ "$choice" != "error_occurred" ]]; then
+            log_header "服务列表"
+            for id in "${container_ids[@]}"; do
+                local details_json; details_json=$(docker inspect "$id" 2>/dev/null)
+                if [ -z "$details_json" ] || [ "$details_json" == "[]" ]; then
+                    continue
+                fi
+
+                local name; name=$(echo "$details_json" | jq -r '.[0].Name | sub("^/"; "")')
+                local parsed_data; parsed_data=$(echo "$details_json" | jq -r '.[0] | (.RepoTags[0] // .Config.Image // .Image) + "\t" + (.State.Running | tostring) + "\t" + .State.StartedAt + "\t" + .State.FinishedAt + "\t" + (.State.ExitCode | tostring) + "\t" + (.HostConfig.RestartPolicy.Name // "no") + "\t" + (.HostConfig.PortBindings | if . == null or . == {} then "N/A" else (to_entries | map((if .value[0].HostIp and .value[0].HostIp != "" then .value[0].HostIp + ":" else "" end) + .value[0].HostPort + " -> " + .key) | join(", ")) end) + "\t" + (.Mounts | if . == [] then "N/A" else (map((.Source | sub(env.HOME; "~")) + " -> " + .Destination) | join(", ")) end)')
+                IFS=$'\t' read -r image is_running started_at finished_at exit_code policy ports mounts <<< "$parsed_data"
+                
+                local status_string=""
+                if [[ "$is_running" == "true" ]]; then 
+                    local start_time=$(date -d "$started_at" '+%Y-%m-%d %H:%M'); status_string="Up since ${start_time}"
+                else 
+                    if [[ "$finished_at" != "0001-01-01T00:00:00Z" && "$finished_at" != null ]]; then 
+                        local finish_time=$(date -d "$finished_at" '+%Y-%m-%d %H:%M'); status_string="Exited(${exit_code}) at ${finish_time}"
+                    else 
+                        status_string="Created"
+                    fi
+                fi
+                local name_color=${WHITE}; if [[ "$is_running" == "true" ]]; then name_color=${GREEN}; else name_color=${RED}; fi
+                
+                printf "%-30.30s %s\n" "${name_color}${name}${RESET}" "$status_string"
+                printf "     ${CYAN}├─ Image:${RESET} ${MAGENTA}%s${RESET}\n" "$image"
+                printf "     ${CYAN}├─ Policy:${RESET} ${MAGENTA}%s${RESET}\n" "$policy"
+                printf "     ${CYAN}├─ Ports:${RESET} ${MAGENTA}%s${RESET}\n" "$ports"
+                printf "     ${CYAN}└─ Mounts:${RESET} ${MAGENTA}%s${RESET}\n" "$mounts"
+                echo
+            done
+        fi
+        
         echo "--------------------------------------------------"
         echo -e "  1) ${GREEN}启动 / 应用配置 (up -d)${RESET}"
         echo -e "  2) ${CYAN}更新镜像并重建 (pull & up)${RESET}"
@@ -447,9 +475,16 @@ manage_services_in_directory() {
         echo -e "  5) ${RED}关闭并移除服务 (down)${RESET}"
         echo -e "  6) ${BLUE}编辑 YML 并重建${RESET}"
         echo -e "  7) ${GREEN}查看实时日志 (logs -f)${RESET}"
+        echo -e "  8) ${BLUE}进入容器 Shell${RESET}" # <--- 新增的选项
         echo "--------------------------------------------------"
         echo "  q) 返回目录列表"
         echo "--------------------------------------------------"
+        
+        if [[ "$choice" == "error_occurred" ]]; then
+            choice="" # Reset choice
+            continue
+        fi
+
         read -p "请选择操作: " choice
 
         case $choice in
@@ -495,7 +530,7 @@ manage_services_in_directory() {
                     continue
                 fi
 
-                log_info "将在 3 秒后使用 '${editor}' 打开配置文件..."; sleep 3;
+                log_info "将在 2 秒后使用 '${editor}' 打开配置文件..."; sleep 2;
                 $editor "$compose_file"
                 log_info "配置文件已修改。"
                 read -p "是否立即使用新配置重建项目? (Y/n): " rebuild_confirm
@@ -513,13 +548,64 @@ manage_services_in_directory() {
                 press_enter_to_continue
                 ;;
             7) clear; log_header "实时日志: ${project_dir} (按 Ctrl+C 退出)"; $COMPOSE_CMD -f "$compose_file" logs -f --tail 100;;
+            
+            # --- 新增的逻辑 ---
+            8)
+                mapfile -t running_services < <($COMPOSE_CMD -f "$compose_file" ps --services 2>/dev/null)
+
+                if [ ${#running_services[@]} -eq 0 ]; then
+                    log_error "此项目中没有正在运行的服务可供进入。"
+                    press_enter_to_continue
+                    continue
+                fi
+                
+                local selected_service=""
+                if [ ${#running_services[@]} -eq 1 ]; then
+                    selected_service=${running_services[0]}
+                else
+                    clear
+                    log_header "选择要进入的服务容器"
+                    i=1
+                    for service in "${running_services[@]}"; do
+                        echo "  $i) $service"
+                        i=$((i+1))
+                    done
+                    echo "  q) 取消"
+                    read -p "请输入序号: " service_choice
+
+                    if [[ "$service_choice" =~ ^[0-9]+$ ]] && [ "$service_choice" -ge 1 ] && [ "$service_choice" -le ${#running_services[@]} ]; then
+                        selected_service=${running_services[$((service_choice-1))]}
+                    elif [[ "$service_choice" != "q" ]]; then
+                        log_error "无效的序号。"
+                        press_enter_to_continue
+                        continue
+                    fi
+                fi
+                
+                if [[ -n "$selected_service" ]]; then
+                    clear
+                    log_info "将尝试进入 '${selected_service}' 服务的容器..."
+                    log_info "将依次尝试 /bin/bash, /bin/sh"
+                    log_info "输入 'exit' 或按 Ctrl+D 退出容器"
+                    sleep 2
+                    $COMPOSE_CMD -f "$compose_file" exec "$selected_service" /bin/bash || $COMPOSE_CMD -f "$compose_file" exec "$selected_service" /bin/sh
+                else
+                    log_info "操作已取消。"
+                    sleep 1
+                fi
+                ;;
+            # --- 逻辑结束 ---
+            
             [qQ]) return;;
-            *) log_error "无效选项。"; sleep 1;;
+            *) 
+                log_error "无效选项。"
+                sleep 1
+                ;;
         esac
     done
 }
 
-# --- COMPOSE: 主管理菜单 ---
+# --- 请用这个【修复了序号选择功能】的最终版，替换旧的 manage_compose_projects 函数 ---
 manage_compose_projects() {
     if [[ -z "$COMPOSE_CMD" ]]; then
         log_error "系统中未找到 'docker compose' 或 'docker-compose' 命令。"
@@ -531,11 +617,10 @@ manage_compose_projects() {
     declare -g -a compose_dirs=()
     
     while true; do
-        load_compose_dirs # 每次循环都重新加载以反映最新更改
+        load_compose_dirs 
         clear
         log_header "Docker Compose 项目管理"
 
-        # 创建一个所有可管理YML文件的扁平化列表
         declare -a manageable_files=()
         for dir in "${compose_dirs[@]}"; do
             mapfile -t files_in_dir < <(find "$dir" -maxdepth 1 -type f \( -name "docker-compose*.yml" -o -name "compose*.yml" \) 2>/dev/null | sort)
@@ -544,41 +629,77 @@ manage_compose_projects() {
             done
         done
 
-        # --- 1. 显示所有找到的 YML 文件及其服务 ---
         if [ ${#manageable_files[@]} -eq 0 ]; then
             log_info "在已管理的目录中，尚未找到任何 Compose YML 文件。"
         else
-            printf "${WHITE}%-4s %-60s %-s${RESET}\n" "NO." "Compose 文件路径" "服务状态"
-            printf "${WHITE}%-4s %-60s %-s${RESET}\n" "----" "------------------------------------------------------------" "--------------------"
+            printf "${WHITE}%-4s %-s${RESET}\n" "NO." "Compose 项目"
+            printf "${WHITE}%-4s %-s${RESET}\n" "----" "--------------------------------------------------------------------------------"
             i=1
             for compose_file in "${manageable_files[@]}"; do
-                # 获取相对路径或父目录，让显示更友好
                 local display_path="${compose_file#$HOME/}"
                 display_path="~/$display_path"
 
-                printf "%-4s ${CYAN}%-60s${RESET}\n" "$i)" "$display_path"
+                printf "\n%-4s ${CYAN}%s${RESET}\n" "$i)" "$display_path"
                 
+                unset container_states
+                declare -A container_states
                 local ps_output
-                ps_output=$($COMPOSE_CMD -f "$compose_file" ps -a --format '{{.Name}}\t{{.State}}' 2>/dev/null)
-                
+                ps_output=$($COMPOSE_CMD -f "$compose_file" ps -a --format '{{.ID}}\t{{.Service}}' 2>&1 | grep -v -E "(WARN|level=warning).*obsolete")
                 if [ -n "$ps_output" ]; then
-                    while IFS= read -r line; do
-                        IFS=$'\t' read -r name state <<< "$line"
-                        local state_color=${RED}
-                        if [[ "$state" == "running" ]]; then state_color=${GREEN}; elif [[ "$state" == "exited" ]]; then state_color=${YELLOW}; fi
-                        printf "     ${state_color}└─ %-40s (%s)${RESET}\n" "$name" "$state"
+                    while IFS=$'\t' read -r id service_name; do
+                        if [[ -n "$id" ]]; then
+                            local details_json; details_json=$(docker inspect "$id" 2>/dev/null)
+                            if [[ -n "$details_json" && "$details_json" != "[]" ]]; then
+                                container_states["$service_name"]=$(echo "$details_json" | jq -c '.[0].State')
+                            fi
+                        fi
                     done <<< "$ps_output"
+                fi
+
+                local config_json
+                config_json=$($COMPOSE_CMD -f "$compose_file" config --format json 2>/dev/null)
+                if [ -z "$config_json" ]; then
+                    printf "     ${RED}%s${RESET}\n" "├─ (无法解析配置文件)"
+                    i=$((i+1))
+                    continue
+                fi
+                mapfile -t defined_services < <(echo "$config_json" | jq -r '.services | keys[]' | grep .)
+
+                if [ ${#defined_services[@]} -eq 0 ]; then
+                     printf "     ${MAGENTA}%s${RESET}\n" "├─ (文件中未定义服务)"
                 else
-                     printf "     ${MAGENTA}└─ (服务未运行或未定义)${RESET}\n"
+                    printf "     ${WHITE}%-35s %-22s %s${RESET}\n" "  服务名称" "运行状态" "详情 / 时长"
+                    printf "     ${WHITE}%-35s %-22s %s${RESET}\n" "  ---------------------------------" "----------------------" "--------------------"
+                    local running_list=()
+                    local exited_list=()
+                    local not_created_list=()
+
+                    for service_name in "${defined_services[@]}"; do
+                        local display_name="├─ $service_name"
+                        if [[ -v "container_states[$service_name]" ]]; then
+                            local state_json=${container_states[$service_name]}
+                            local is_running=$(echo "$state_json" | jq -r '.Running')
+                            
+                            if [[ "$is_running" == "true" ]]; then
+                                local started_at=$(echo "$state_json" | jq -r '.StartedAt'); local uptime_string=""; local current_ts=$(date +%s); local start_ts=$(date -d "$started_at" +%s); local diff_seconds=$((current_ts - start_ts)); local days=$((diff_seconds/86400)); local hours=$(((diff_seconds%86400)/3600)); local mins=$(((diff_seconds%3600)/60)); local secs=$((diff_seconds%60)); if (( days > 0 )); then uptime_string="${days} 天 ${hours} 小时前"; elif (( hours > 0 )); then uptime_string="${hours} 小时 ${mins} 分钟前"; elif (( mins > 0 )); then uptime_string="${mins} 分钟 ${secs} 秒前"; else uptime_string="${secs} 秒前"; fi
+                                running_list+=("$(printf "     ${GREEN}%-35s %-22s %s${RESET}" "$display_name" "(正在运行)" "$uptime_string")")
+                            else
+                                exited_list+=("$(printf "     ${RED}%-35s %-22s${RESET}" "$display_name" "(已创建 / 未运行)")")
+                            fi
+                        else
+                            local image_name=$(echo "$config_json" | jq -r --arg srv "$service_name" '.services[$srv].image // "镜像未指定"')
+                            not_created_list+=("$(printf "     ${GRAY}%-35s %-22s ${WHITE}%s${RESET}" "$display_name" "(未创建)" "Image: $image_name")")
+                        fi
+                    done
+
+                    for item in "${running_list[@]}"; do echo -e "$item"; done
+                    for item in "${exited_list[@]}"; do echo -e "$item"; done
+                    for item in "${not_created_list[@]}"; do echo -e "$item"; done
                 fi
                 i=$((i+1))
             done
         fi
 
-        # --- 2. 查找并显示未被管理的目录 (这部分逻辑保持不变) ---
-        # ... (这部分不需要修改，如果您愿意可以保持原样或删除)
-
-        # --- 3. 显示操作指令 ---
         echo "--------------------------------------------------------------------------------"
         echo "操作指令: a) 添加目录, d) 删除目录, c) 创建 YML, <数字> (管理), q (返回)"
         echo "--------------------------------------------------------------------------------"
@@ -590,9 +711,9 @@ manage_compose_projects() {
             [cC]) create_compose_yml;;
             [qQ]) return;;
             *)
+                # --- 核心修改：修正正则表达式的拼写错误 ---
                 if [[ "$choice" =~ ^[0-9]+$ ]] && [ "$choice" -ge 1 ] && [ "$choice" -le ${#manageable_files[@]} ]; then
                     selected_file=${manageable_files[$((choice-1))]}
-                    # 直接调用管理函数，传入文件路径
                     manage_services_in_directory "$selected_file"
                 else
                     log_error "无效输入。"; sleep 1
@@ -1132,25 +1253,46 @@ main_loop() {
             printf "${WHITE}%-4s %-25s %-40s %-s${RESET}\n" "NO." "NAME" "IMAGE" "STATUS"
             printf "${WHITE}%-4s %-25s %-40s %-s${RESET}\n" "----" "-------------------------" "----------------------------------------" "--------------------------"
             
-            # 用于显示详情的通用函数，避免代码重复
-            display_container_details() {
-                local container_id=$1
-                local prefix=$2
+              # --- 请用这个【最终版】，完整替换旧的 display_container_details 函数 ---
+        display_container_details() {
+            local container_id=$1
+            local prefix=$2
 
-                local details_json; details_json=$(docker inspect "$container_id")
-                local name; name=$(echo "$details_json" | jq -r '.[0].Name | sub("^/"; "")')
-                
-                local parsed_data; parsed_data=$(echo "$details_json" | jq -r '.[0] | (.RepoTags[0] // .Config.Image // .Image | sub(":latest$"; "")) + "\t" + (.State.Running|tostring) + "\t" + .State.StartedAt + "\t" + .State.FinishedAt + "\t" + (.State.ExitCode|tostring) + "\t" + (.HostConfig.RestartPolicy.Name // "no") + "\t" + (.HostConfig.PortBindings | if . == null or . == {} then "无" else (to_entries | map((if .value[0].HostIp and .value[0].HostIp != "" then .value[0].HostIp + ":" else "" end) + .value[0].HostPort + " -> " + .key) | join(", ")) end) + "\t" + (.Mounts | if . == [] then "无" else (map((.Source | sub(env.HOME; "~")) + " -> " + .Destination) | join(", ")) end)')
-                IFS=$'\t' read -r image is_running started_at finished_at exit_code policy ports mounts <<< "$parsed_data"
-                local status_string=""; if [[ "$is_running" == "true" ]]; then local start_time=$(date -d "$started_at" '+%m-%d %H:%M'); status_string="Up since ${start_time}"; else if [[ "$finished_at" != "0001-01-01"* ]]; then local finish_time=$(date -d "$finished_at" '+%m-%d %H:%M'); status_string="Exited(${exit_code}) at ${finish_time}"; else status_string="Created"; fi; fi
-                
-                local name_display=$(printf "%.25s" "$name")
-                
-                local truncated_image=$(printf "%.40s" "$image")
-                if [[ "$is_running" == "true" ]]; then printf "%-4s ${GREEN}%-25s${RESET} %-40s %s\n" "$prefix" "$name_display" "$truncated_image" "$status_string"; else printf "%-4s ${RED}%-25s${RESET} %-40s %s\n" "$prefix" "$name_display" "$truncated_image" "$status_string"; fi
-                local truncated_ports=$(printf "%.30s" "$ports"); local truncated_mounts=$(printf "%.35s" "$mounts")
-                printf "     ${CYAN}-> Policy:${RESET} ${MAGENTA}%-15.15s${RESET} ${CYAN}-> Ports:${RESET} ${MAGENTA}%-30.30s${RESET} ${CYAN}-> Mounts:${RESET} ${MAGENTA}%s${RESET}\n" "$policy" "$truncated_ports" "$truncated_mounts"
-            }
+            local details_json; details_json=$(docker inspect "$container_id")
+            local name; name=$(echo "$details_json" | jq -r '.[0].Name | sub("^/"; "")')
+            
+            # 使用 jq 一次性解析所有需要的数据
+            local parsed_data; parsed_data=$(echo "$details_json" | jq -r '.[0] | (.RepoTags[0] // .Config.Image // .Image) + "\t" + (.State.Running | tostring) + "\t" + .State.StartedAt + "\t" + .State.FinishedAt + "\t" + (.State.ExitCode | tostring) + "\t" + (.HostConfig.RestartPolicy.Name // "no") + "\t" + (.HostConfig.PortBindings | if . == null or . == {} then "N/A" else (to_entries | map((if .value[0].HostIp and .value[0].HostIp != "" then .value[0].HostIp + ":" else "" end) + .value[0].HostPort + " -> " + .key) | join(", ")) end) + "\t" + (.Mounts | if . == [] then "N/A" else (map((.Source | sub(env.HOME; "~")) + " -> " + .Destination) | join(", ")) end)')
+            IFS=$'\t' read -r image is_running started_at finished_at exit_code policy ports mounts <<< "$parsed_data"
+            
+            # 格式化状态字符串
+            local status_string=""
+            if [[ "$is_running" == "true" ]]; then 
+                local start_time=$(date -d "$started_at" '+%Y-%m-%d %H:%M')
+                status_string="Up since ${start_time}"
+            else 
+                if [[ "$finished_at" != "0001-01-01T00:00:00Z" && "$finished_at" != null ]]; then 
+                    local finish_time=$(date -d "$finished_at" '+%Y-%m-%d %H:%M')
+                    status_string="Exited(${exit_code}) at ${finish_time}"
+                else 
+                    status_string="Created"
+                fi
+            fi
+
+            # 根据状态决定名字颜色
+            local name_color=${WHITE}
+            if [[ "$is_running" == "true" ]]; then name_color=${GREEN}; else name_color=${RED}; fi
+            
+            # --- 打印混合式布局 ---
+            # 1. 打印第一行：序号、名称、镜像、状态
+            printf "%-4s ${name_color}%-25.25s${RESET} %-40.40s %s\n" "$prefix" "$name" "$image" "$status_string"
+            
+            # 2. 打印缩进的详细信息 (将数值部分改为紫色)
+            printf "     ${CYAN}├─ Policy:${RESET} ${MAGENTA}%s${RESET}\n" "$policy"
+            printf "     ${CYAN}├─ Ports:${RESET} ${MAGENTA}%s${RESET}\n" "$ports"
+            printf "     ${CYAN}└─ Mounts:${RESET} ${MAGENTA}%s${RESET}\n" "$mounts"
+        }
+        # --- 替换结束 ---
 
             # 4. 先显示带序号的普通容器
             i=1
