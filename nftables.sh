@@ -832,7 +832,63 @@ reset_firewall() {
 
 # --- 连接管理功能 ---
 clear_connections() { while true; do clear; echo -e "${BLUE}--- 连接清理中心 ---${NC}\n"; echo -e "请选择清理模式:"; echo -e " ${GREEN}1.${NC} 清除所有连接 (排除SSH)"; echo -e " ${GREEN}2.${NC} 按端口清除连接"; echo -e " ${GREEN}3.${NC} 按进程清除连接"; echo -e " ${GREEN}q.${NC} 返回主菜单"; echo -e "${PURPLE}------------------------------------------------------${NC}"; read -p "请输入您的选项: " choice; case $choice in 1) flush_conntrack "all"; press_any_key; ;; 2) local port_input_successful=false; while true; do echo -e "\n${CYAN}支持格式 - 单个:80, 多个:80,443, 范围:1000-2000${NC}"; read -p "请输入要清除连接的端口 (输入 'q' 返回): " port_input; if [[ $port_input =~ ^[qQ]$ ]]; then break; fi; local formatted_ports=$(validate_and_format_ports "$port_input"); if [[ $? -eq 0 && -n "$formatted_ports" ]]; then flush_conntrack "$port_input"; port_input_successful=true; break; else echo -e "${RED}输入无效或为空。${NC}"; fi; done; if $port_input_successful; then press_any_key; fi; ;; 3) read -p "请输入进程名 (多个用空格分隔, 'q'返回): " process_names; if [[ $process_names =~ ^[qQ]$ ]]; then continue; fi; local pids=(); local ports=(); local found_process=false; for p in $process_names; do local current_pids=($(pgrep -f "$p")); if [ ${#current_pids[@]} -eq 0 ]; then echo -e "${RED}警告: 未找到进程 '${p}'。${NC}" >&2; continue; fi; found_process=true; pids+=("${current_pids[@]}"); done; if [ "$found_process" == "false" ]; then press_any_key; continue; fi; echo -e "\n${YELLOW}正在查找相关端口...${NC}"; for pid in "${pids[@]}"; do local current_ports=$(ss -tnlp "pid=$pid" | awk 'NR>1 {split($4, a, ":"); print a[length(a)]}' | sort -u); if [[ -n "$current_ports" ]]; then echo -e "  - 进程 ID ${GREEN}${pid}${NC} 关联端口: ${current_ports}"; ports+=($(echo "$current_ports" | tr '\n' ' ')); fi; done; if [ ${#ports[@]} -eq 0 ]; then echo -e "${YELLOW}未找到任何与指定进程关联的开放端口。${NC}"; else ports=($(echo "${ports[@]}" | tr ' ' '\n' | sort -u | tr '\n' ' ')); local ports_str=$(IFS=,; echo "${ports[*]}"); echo -e "${CYAN}发现所有关联端口: ${ports[*]}.${NC}"; flush_conntrack "$ports_str"; fi; press_any_key; ;; q|Q) break; ;; *) echo -e "\n${RED}无效选项，请重新输入。${NC}"; sleep 2; ;; esac; done; }
-toggle_ipv4_ping() { clear; echo -e "${BLUE}--- 切换 IPv4 ICMP (Ping) 状态 ---${NC}\n"; local PING_RULE_COMMENT="Allow IPv4 Ping"; local handle=$(nft --handle list chain inet "${TABLE_NAME}" "${INPUT_CHAIN}" | grep "comment \"${PING_RULE_COMMENT}\"" | awk '{print $NF}'); if [[ -n "$handle" ]]; then echo -e "${YELLOW}当前 IPv4 Ping 是允许的，正在切换为 [阻断]...${NC}"; nft delete rule inet "${TABLE_NAME}" "${INPUT_CHAIN}" handle "${handle}"; apply_and_save_changes $? "阻断 IPv4 Ping"; else echo -e "${YELLOW}当前 IPv4 Ping 是阻断的，正在切换为 [允许]...${NC}"; nft insert rule inet "${TABLE_NAME}" "${INPUT_CHAIN}" ip protocol icmp icmp type echo-request accept comment "\"${PING_RULE_COMMENT}\""; apply_and_save_changes $? "允许 IPv4 Ping"; fi; }
+toggle_ipv4_ping() {
+    clear
+    echo -e "${BLUE}--- 切换 IPv4 ICMP (Ping) 状态 (终极净化版) ---${NC}\n"
+
+    # --- 1. 获取所有相关状态 ---
+    local current_policy=$(nft list chain inet ${TABLE_NAME} ${INPUT_CHAIN} 2>/dev/null | grep -o 'policy \w*' | awk '{print $2}')
+    local PING_ACCEPT_COMMENT="Allow IPv4 Ping"
+    local PING_DROP_COMMENT="Block IPv4 Ping (Policy-Accept-Mode)"
+
+    # 分别查找 accept 规则和 drop 规则的句柄
+    local accept_handle=$(nft --handle list chain inet "${TABLE_NAME}" "${INPUT_CHAIN}" | grep "comment \"${PING_ACCEPT_COMMENT}\"" | awk '{print $NF}')
+    local drop_handle=$(nft --handle list chain inet "${TABLE_NAME}" "${INPUT_CHAIN}" | grep "comment \"${PING_DROP_COMMENT}\"" | awk '{print $NF}')
+
+    echo -e "${CYAN}检测到当前入站策略为: ${YELLOW}${current_policy}${NC}\n"
+
+    # --- 2. 根据当前策略，执行净化和切换 ---
+    if [[ "$current_policy" == "drop" ]]; then
+        # === 当前是 DROP 策略模式 (白名单逻辑) ===
+
+        # 关键净化：如果发现了不该存在的 drop 规则，立即删除它！
+        if [[ -n "$drop_handle" ]]; then
+            echo -e "${YELLOW}检测到残留的 'accept-mode' 规则，正在自动清理...${NC}"
+            nft delete rule inet "${TABLE_NAME}" "${INPUT_CHAIN}" handle "${drop_handle}"
+        fi
+
+        # 执行正常的切换逻辑
+        if [[ -n "$accept_handle" ]]; then
+            echo -e "${YELLOW}当前 Ping 是 [允许] 的，正在切换为 [阻断]...${NC}"
+            nft delete rule inet "${TABLE_NAME}" "${INPUT_CHAIN}" handle "${accept_handle}"
+            apply_and_save_changes $? "阻断 IPv4 Ping"
+        else
+            echo -e "${YELLOW}当前 Ping 是 [阻断] 的，正在切换为 [允许]...${NC}"
+            nft add rule inet "${TABLE_NAME}" "${INPUT_CHAIN}" ip protocol icmp icmp type echo-request accept comment "\"${PING_ACCEPT_COMMENT}\""
+            apply_and_save_changes $? "允许 IPv4 Ping"
+        fi
+
+    else # policy 为 accept 的情况
+        # === 当前是 ACCEPT 策略模式 (黑名单逻辑) ===
+
+        # 关键净化：如果发现了不该存在的 accept 规则，立即删除它！
+        if [[ -n "$accept_handle" ]]; then
+            echo -e "${YELLOW}检测到残留的 'drop-mode' 规则，正在自动清理...${NC}"
+            nft delete rule inet "${TABLE_NAME}" "${INPUT_CHAIN}" handle "${accept_handle}"
+        fi
+
+        # 执行正常的切换逻辑
+        if [[ -n "$drop_handle" ]]; then
+            echo -e "${YELLOW}当前 Ping 是 [阻断] 的，正在切换为 [允许]...${NC}"
+            nft delete rule inet "${TABLE_NAME}" "${INPUT_CHAIN}" handle "${drop_handle}"
+            apply_and_save_changes $? "允许 IPv4 Ping (移除阻断规则)"
+        else
+            echo -e "${YELLOW}当前 Ping 是 [允许] 的，正在切换为 [阻断]...${NC}"
+            nft add rule inet "${TABLE_NAME}" "${INPUT_CHAIN}" ip protocol icmp icmp type echo-request drop comment "\"${PING_DROP_COMMENT}\""
+            apply_and_save_changes $? "阻断 IPv4 Ping (添加阻断规则)"
+        fi
+    fi
+}
 
 toggle_default_policy() {
     clear
@@ -2525,15 +2581,34 @@ main_menu() {
         autostart_status="${RED}未自启${NC}"
     fi
     
-    local ipv4_ping_status="${RED}已阻断${NC}"
-    local ipv4_ping_status_text="${RED}阻断${NC}"
+    # --- 智能 Ping 状态检测逻辑 ---
+local ipv4_ping_status
+local ipv4_ping_status_text
+
+# (变量 policy_input 在此函数前面部分已经获取，这里直接使用)
+if [[ "$policy_input" == "drop" ]]; then
+    # 在 policy drop 模式下，必须有明确的 accept 规则才算放行
     if nft list ruleset | grep -q 'comment "Allow IPv4 Ping"'; then
         ipv4_ping_status="${GREEN}已放行${NC}"
         ipv4_ping_status_text="${GREEN}允许${NC}"
+    else
+        ipv4_ping_status="${RED}已阻断${NC}"
+        ipv4_ping_status_text="${RED}阻断${NC}"
     fi
+else # policy 为 accept 的情况
+    # 在 policy accept 模式下，必须有明确的 drop 规则才算阻断
+    if nft list ruleset | grep -q 'comment "Block IPv4 Ping (Policy-Accept-Mode)"'; then
+        ipv4_ping_status="${RED}已阻断${NC}"
+        ipv4_ping_status_text="${RED}阻断${NC}"
+    else
+        ipv4_ping_status="${GREEN}已放行${NC}"
+        ipv4_ping_status_text="${GREEN}允许${NC}"
+    fi
+fi
+# --- 智能检测逻辑结束 ---
 
     local ssh_port_info
-    ssh_port_info=$(ss -tlpn "sport = :*" 2>/dev/null | grep 'sshd' | grep -oE ':[0-9]+' | sed 's/://g' | sort -u | tr '\n' ',' | sed 's/,$//')
+    ssh_port_info=$(ss -tlpn 2>/dev/null | grep 'sshd' | grep -E '(\*|0\.0\.0\.0|\[::\]):[0-9]+' | grep -oE ':[0-9]+' | sed 's/://g' | sort -u | tr '\n' ',' | sed 's/,$//')
     if [[ -z "$ssh_port_info" ]]; then
         ssh_port_info="${YELLOW}未知${NC}"
     else
