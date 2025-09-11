@@ -280,8 +280,56 @@ function start_firewall() {
 function load_or_initialize_firewall() { if [ -f /etc/debian_version ] && command -v netfilter-persistent &>/dev/null; then netfilter-persistent start &>/dev/null; elif [ -f /etc/redhat-release ] && command -v systemctl &>/dev/null; then systemctl is-active --quiet "$SAVE_SERVICE_NAME.service" || systemctl start "$SAVE_SERVICE_NAME.service" &>/dev/null; systemctl is-active --quiet "ipset.service" || systemctl start "ipset.service" &>/dev/null; else local rules_to_load=$RULES_FILE; if [ -f /etc/redhat-release ]; then rules_to_load=$RULES_FILE_RHEL; fi; if [ -f "$rules_to_load" ] && [ -s "$rules_to_load" ]; then "$IPTABLES_CMD-restore" < "$rules_to_load"; fi; fi; if ! $IPTABLES_CMD -L "GEOBLOCK_IN" &>/dev/null || ! $IPTABLES_CMD -L "GEOWHITELIST_IN" &>/dev/null ; then echo -e "${YELLOW}未找到防火墙核心架构，正在初始化...${NC}"; start_firewall; fi; }
 function stop_firewall() { echo -e "${YELLOW}正在停止 ${IP_VERSION} 防火墙...${NC}"; $IPTABLES_CMD -F; $IPTABLES_CMD -X; $IPTABLES_CMD -P INPUT ACCEPT; $IPTABLES_CMD -P FORWARD ACCEPT; $IPTABLES_CMD -P OUTPUT ACCEPT; echo -e "${RED}✓ ${IP_VERSION} 防火墙已停止。${NC}"; save_all_rules; flush_connections_safely; }
 function show_full_status() { clear; echo -e "${BLUE}--- ${IP_VERSION} 防火墙状态 (filter 表) ---${NC}"; $IPTABLES_CMD -L -v -n --line-numbers; if [[ "$IP_VERSION" == "IPv4" ]]; then echo; echo -e "${BLUE}--- ${IP_VERSION} NAT 表 ---${NC}"; $IPTABLES_CMD -t nat -L -v -n --line-numbers 2>/dev/null || echo -e "${YELLOW}NAT 表不存在或内核不支持。${NC}"; fi; echo "------------------------------------------"; }
-function check_icmp_status() { if $IPTABLES_CMD -C INPUT -p "$ICMP_PROTO" -j ACCEPT &>/dev/null; then echo "允许"; else if [[ "$ICMP_PROTO" == "icmpv6" ]] && $IPTABLES_CMD -C INPUT -p icmpv6 --icmpv6-type echo-request -j DROP &>/dev/null; then echo "阻止"; elif $IPTABLES_CMD -L INPUT -n | head -n 1 | grep -q "policy DROP"; then echo "阻止"; else echo "允许"; fi; fi; }
-function toggle_icmp() { local current_status; current_status=$(check_icmp_status); $IPTABLES_CMD -D INPUT -p "$ICMP_PROTO" -j ACCEPT &>/dev/null; if [[ "$ICMP_PROTO" == "icmpv6" ]]; then $IPTABLES_CMD -D INPUT -p icmpv6 --icmpv6-type echo-request -j DROP &>/dev/null; fi; if [ "$current_status" == "允许" ]; then if [[ "$ICMP_PROTO" == "icmpv6" ]]; then $IPTABLES_CMD -A INPUT -p icmpv6 --icmpv6-type echo-request -j DROP; fi; echo -e "${RED}ICMP (Ping) 已被阻止。${NC}"; else $IPTABLES_CMD -A INPUT -p "$ICMP_PROTO" -j ACCEPT; echo -e "${GREEN}ICMP (Ping) 已被允许。${NC}"; fi; save_all_rules; flush_connections_safely; }
+function check_icmp_status() {
+    # 规则 1: 检查是否存在明确的 ACCEPT 规则。这是最高优先级。
+    if $IPTABLES_CMD -C INPUT -p "$ICMP_PROTO" -j ACCEPT &>/dev/null; then
+        echo "允许"
+    # 规则 2: 检查是否存在明确的 DROP 规则。这是第二优先级。
+    # 这里的检查逻辑现在可以覆盖到我们在 ACCEPT 策略下手动添加的 DROP 规则。
+    elif $IPTABLES_CMD -C INPUT -p "$ICMP_PROTO" -j DROP &>/dev/null || \
+         ( [[ "$ICMP_PROTO" == "icmpv6" ]] && $IPTABLES_CMD -C INPUT -p icmpv6 --icmpv6-type echo-request -j DROP &>/dev/null ); then
+        echo "阻止"
+    # 规则 3: 如果没有任何明确的允许或阻止规则，再根据默认策略来判断。
+    elif $IPTABLES_CMD -L INPUT -n | head -n 1 | grep -q "policy DROP"; then
+        echo "阻止"
+    # 规则 4: 如果默认策略不是 DROP (那就是 ACCEPT)，且没有其他规则，则为允许。
+    else
+        echo "允许"
+    fi
+}
+function toggle_icmp() {
+    local current_status
+    current_status=$(check_icmp_status)
+    local rule_pos=4 # 定义一个安全插入位置（通常在 conntrack, lo, ssh 规则之后）
+
+    # 统一清理旧规则：使用 -D (Delete) 可以精确删除，无论规则在哪里
+    $IPTABLES_CMD -D INPUT -p "$ICMP_PROTO" -j ACCEPT &>/dev/null
+    if [[ "$ICMP_PROTO" == "icmpv6" ]]; then
+        $IPTABLES_CMD -D INPUT -p icmpv6 --icmpv6-type echo-request -j DROP &>/dev/null
+    else
+        $IPTABLES_CMD -D INPUT -p icmp -j DROP &>/dev/null
+    fi
+
+    # 根据当前状态，执行相反的操作
+    if [ "$current_status" == "允许" ]; then
+        # 如果当前是“允许”，则切换为“阻止”
+        # 使用 -I (Insert) 插入规则，确保高优先级
+        if [[ "$ICMP_PROTO" == "icmpv6" ]]; then
+            $IPTABLES_CMD -I INPUT $rule_pos -p icmpv6 --icmpv6-type echo-request -j DROP
+        else
+            $IPTABLES_CMD -I INPUT $rule_pos -p icmp -j DROP
+        fi
+        echo -e "${RED}ICMP (Ping) 已被阻止。${NC}"
+    else
+        # 如果当前是“阻止”，则切换为“允许”
+        # 同样使用 -I (Insert) 插入规则，确保它在拦截规则之前被匹配
+        $IPTABLES_CMD -I INPUT $rule_pos -p "$ICMP_PROTO" -j ACCEPT
+        echo -e "${GREEN}ICMP (Ping) 已被允许。${NC}"
+    fi
+
+    save_all_rules
+    flush_connections_safely
+}
 function check_default_policy() { $IPTABLES_CMD -L INPUT -n | head -n 1 | awk -F '[() ]' '{print $5}'; }
 function toggle_default_policy() { local current_policy; current_policy=$(check_default_policy); if [[ "$current_policy" == "DROP" ]]; then echo -e "\n${YELLOW}警告: 您正试图将核心策略切换为 'ACCEPT'，这会极大降低安全性。${NC}"; read -p "您确定吗? (请输入 'yes' 确认): " confirm; if [[ "$confirm" == "yes" ]]; then $IPTABLES_CMD -P INPUT ACCEPT; echo -e "\n${GREEN}✓ 防火墙核心策略已切换为 ACCEPT。${NC}"; save_all_rules; flush_connections_safely; else echo -e "\n${GREEN}操作已取消。${NC}"; fi; else $IPTABLES_CMD -P INPUT DROP; echo -e "\n${GREEN}✓ 防火墙核心策略已切换回 DROP。${NC}"; save_all_rules; flush_connections_safely; fi; }
 
