@@ -212,6 +212,27 @@ check_dependencies() {
             log_error "用户取消安装。部分功能可能无法正常显示。"; press_enter_to_continue
         fi
     fi
+    # --- 可以将这段代码添加到 check_dependencies 函数中 ---
+
+    # 4. 检查 file 命令
+    if ! command_exists file; then
+        clear
+        log_info "核心功能需要 'file' (文件类型识别工具)。"
+        read -p "系统未检测到 file, 是否需要自动为您安装? (y/N): " choice
+        if [[ "$choice" =~ ^[yY]$ ]]; then
+            log_info "正在尝试安装 file..."
+            if command_exists apt-get; then sudo apt-get update && sudo apt-get install -y file;
+            elif command_exists yum; then sudo yum install -y file;
+            elif command_exists dnf; then sudo dnf install -y file;
+            else log_error "无法确定包管理器，请手动安装 file。"; fi
+
+            if command_exists file; then log_success "file 安装成功！";
+            else log_error "file 安装失败。"; fi
+            press_enter_to_continue
+        else
+            log_error "用户取消安装。部分功能可能无法正常运行。"; press_enter_to_continue
+        fi
+    fi
 
     # 3. 检查并设置 docker-compose 命令
     if docker compose version &>/dev/null; then
