@@ -53,8 +53,8 @@ function select_protocol() {
     echo "                           IPTables 防火墙管理器 V40.3.2 (社区修正版)"
     echo "======================================================"
     echo "请选择您要管理的防火墙协议："
-    echo " 1. IPv4 (全功能)"
-    echo " 2. IPv6 (全功能, 不支持NAT转发)"
+    echo " 1. IPv4"
+    echo " 2. IPv6"
     echo "------------------------------------------------------"
     read -p "请输入选择 [回车默认为 1 (IPv4)]: " proto_choice
 
@@ -681,13 +681,8 @@ function show_unified_menu() {
     local ssh_port; ssh_port=$(sshd -T 2>/dev/null | grep -i '^port ' | awk '{print $2}' | head -n1); ssh_port=${ssh_port:-22}; local icmp_status=$(check_icmp_status); local icmp_color="${RED}"; if [ "$icmp_status" == "允许" ]; then icmp_color="${GREEN}"; fi; local policy=$(check_default_policy); local policy_color="${GREEN}"; if [ "$policy" == "ACCEPT" ]; then policy_color="${RED}"; fi; local fwd_status=$(get_forwarding_status); local fwd_color="${RED}"; if [[ "$fwd_status" == "已开启" ]]; then fwd_color="${GREEN}"; fi; local fw_status=$(get_firewall_status); clear
     echo "======================================================"; echo -e "       IPTables 防火墙管理器 (V40.3.2 - ${YELLOW}${IP_VERSION} 智能守护模式${NC})"; echo -e " (防火墙: ${fw_status} | SSH:${ssh_port} | 策略:${policy_color}${policy}${NC} | 转发:${fwd_color}${fwd_status}${NC})"; echo "======================================================"
     echo -e "--- 主机防护 (INPUT) ---"; echo -e " 1. 新增 IP 到白名单"; echo -e " 2. 新增 IP 到黑名单"; echo -e " 3. 新增 [端口放行] 规则"; echo -e " 4. 新增 [端口封锁] 规则"; echo -e " 5. 黑白名单及端口策略删除"; echo -e " 6. ${BLUE}IP 封锁管理 (Geo-IP 黑名单)${NC}"; echo -e " 7. ${GREEN}IP 许可管理 (Geo-IP 白名单)${NC}"
-    echo; echo -e "--- 出站与转发 (OUTPUT & FORWARD) ---"; local menu_index=8; echo -e " ${menu_index}. 新增 OUTPUT 规则"; menu_index=$((menu_index+1)); echo -e " ${menu_index}. 删除 OUTPUT 规则"; menu_index=$((menu_index+1)); echo -e " ${menu_index}. 新增 FORWARD 规则"; menu_index=$((menu_index+1)); echo -e " ${menu_index}. 删除 FORWARD 规则"; menu_index=$((menu_index+1))
-    if [[ "$IP_VERSION" == "IPv4" ]]; then
-        echo; echo -e "--- 端口转发 (NAT) 与 Docker ---"
-        echo -e " ${menu_index}. 新增端口转发/映射 (DNAT)"; menu_index=$((menu_index+1))
-        echo -e " ${menu_index}. 查看/删除端口转发规则"; menu_index=$((menu_index+1))
-        echo -e " ${menu_index}. ${CYAN}Docker 网络防火墙管理${NC}"; menu_index=$((menu_index+1))
-    fi
+    echo; echo -e "--- 出站管理 (OUTPUT) ---"; local menu_index=8; echo -e " ${menu_index}. 新增 OUTPUT 规则"; menu_index=$((menu_index+1)); echo -e " ${menu_index}. 删除 OUTPUT 规则"; menu_index=$((menu_index+1));
+    # 删除了 FORWARD, NAT, Docker 的菜单项
     echo; echo -e "--- 系统与监控 ---"; echo -e " 20. 查看完整防火墙状态"; echo -e " 21. ${GREEN}查看连接与网络监控${NC}"; echo -e " 22. 切换 ICMP (Ping) 状态 (当前: ${icmp_color}${icmp_status}${NC})"; echo -e " 23. ${YELLOW}切换默认策略 (当前: ${policy_color}${policy}${NC})${NC}"; echo -e " 24. ${YELLOW}重置防火墙为默认结构 (谨慎操作)${NC}"; echo -e " 25. 手动储存所有规则"; echo -e " 26. ${RED}清除所有已建立的连接 (谨慎操作)${NC}"; echo -e " 27. ${YELLOW}调整规则与链路表顺序 (谨慎操作)${NC}"; echo -e " 28. ${YELLOW}Fail2ban 管理中心${NC}"; echo -e " 29. ${GREEN}安装/更新终端快捷命令 (safe, f2b-menu)${NC}"; echo -e " 30. ${RED}卸载终端快捷命令${NC}"; echo -e " 31. ${BLUE}备份与恢复规则${NC}"
     echo "------------------------------------------"; local switch_option_text=""; if [[ "$IP_VERSION" == "IPv4" ]]; then switch_option_text="切换到 IPv6 管理"; else switch_option_text="切换到 IPv4 管理"; fi; echo -e " s. ${YELLOW}${switch_option_text}${NC}"; echo -e " q. 退出"
     echo "======================================================"; read -p "请输入您的选择: " choice
@@ -708,10 +703,11 @@ while true; do
     show_unified_menu
     case $choice in
         1) add_to_list "白名单" "WHITELIST" "ACCEPT" ;; 2) add_to_list "黑名单" "BLACKLIST" "DROP" ;; 3) manage_port_rule "PORT_ALLOW" "ACCEPT" "放行" ;; 4) manage_port_rule "PORT_DENY" "DROP" "禁止" ;;
-        5) interactive_delete_rule ;; 6) manage_geoip ;; 7) manage_geowhitelist ;; 8) add_chain_rule "OUTPUT" ;; 9) delete_chain_rule "OUTPUT" ;; 10) add_chain_rule "FORWARD" ;; 11) delete_chain_rule "FORWARD" ;;
-        12) if [[ "$IP_VERSION" == "IPv4" ]]; then add_port_forward_rule; fi ;;
-        13) if [[ "$IP_VERSION" == "IPv4" ]]; then view_delete_port_forward_rules; fi ;;
-        14) if [[ "$IP_VERSION" == "IPv4" ]]; then manage_docker_menu; fi ;;
+        5) interactive_delete_rule ;; 6) manage_geoip ;; 7) manage_geowhitelist ;; 8) add_chain_rule "OUTPUT" ;; 9) delete_chain_rule "OUTPUT" ;;
+        # 10) add_chain_rule "FORWARD" ;; 11) delete_chain_rule "FORWARD" ;;
+        # 12) if [[ "$IP_VERSION" == "IPv4" ]]; then add_port_forward_rule; fi ;;
+        # 13) if [[ "$IP_VERSION" == "IPv4" ]]; then view_delete_port_forward_rules; fi ;;
+        # 14) if [[ "$IP_VERSION" == "IPv4" ]]; then manage_docker_menu; fi ;;
         20) show_full_status ;; 21) view_connections ;; 22) toggle_icmp ;; 23) toggle_default_policy ;; 24) start_firewall ;; 25) save_all_rules ;; 26) flush_connections_safely ;;
         27) manage_rule_ordering_menu ;; 28) manage_fail2ban_menu ;; 29) install_as_command ;; 30) uninstall_command ;; 31) manage_backup_restore_menu ;;
         s|S) switch_protocol_and_reload; continue ;; q|Q) echo "正在退出..."; exit 0 ;; *) echo -e "${RED}无效输入...${NC}" ;;
