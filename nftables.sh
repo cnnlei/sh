@@ -517,10 +517,16 @@ edit_rule_interactive() {
                 fi
 
                 if [[ -n "$protocol" ]]; then
-                    cmd_str+=" $protocol"
-                    if [[ -n "$sport" ]]; then cmd_str+=" sport $(validate_and_format_ports "$sport")"; fi
-                    if [[ -n "$dport" ]]; then cmd_str+=" dport $(validate_and_format_ports "$dport")"; fi
-                fi
+    # 智能判断：如果规则里有具体的端口，才直接使用协议名称
+    if [[ -n "$sport" || -n "$dport" ]]; then
+        cmd_str+=" $protocol"
+        if [[ -n "$sport" ]]; then cmd_str+=" sport $(validate_and_format_ports "$sport")"; fi
+        if [[ -n "$dport" ]]; then cmd_str+=" dport $(validate_and_format_ports "$dport")"; fi
+    else
+        # 如果规则里没有端口（即匹配所有端口），必须使用 'meta l4proto' 语法
+        cmd_str+=" meta l4proto $protocol"
+    fi
+fi
 
                 cmd_str+=" $action comment \\\"$comment\\\""
 
