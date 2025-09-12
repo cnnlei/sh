@@ -1,18 +1,8 @@
 #!/bin/bash
 
 # ======================================================================
-#  专业多链交互式 IPTables 管理器 (v40.3.2 - 社区修正版)
+#  IPTables 管理器 (v1.0.0 )
 # ======================================================================
-#  - 版本说明 (v40.3.2):
-#    - [功能强化] 为“重置防火墙”功能增加了二次确认步骤，防止误操作。
-#    - [UI优化] 在菜单中将“重置防火墙”标记为谨慎操作。
-#  - (继承 v40.3.1):
-#    - [BUG修复] 修正了 `add_port_forward_rule` 中通用且不精确的 MASQUERADE 规则，
-#      现在会为每个转发创建对应的、带有源地址的特定伪装规则，避免了在复杂 NAT 环境下的“单向通”问题。
-#    - [BUG修复] 修正了 `view_delete_port_forward_rules` 逻辑，使其能够识别并
-#      一并清除 v40.3.1 版本创建的特定 MASQUERADE 规则，确保规则集能够被完整移除。
-#    - (继承 v40.3) 修正了 unattended_dep_deployment 中错误的数组声明。
-#    - (继承 v40.3) 优化了 Docker 模块，现在可以正确处理并让用户选择拥有多个 IP 地址的容器。
 # ======================================================================
 
 # --- 配置 ---
@@ -275,7 +265,32 @@ function start_firewall() {
     fi
     # --- END of new code ---
 
-      echo -e "${YELLOW}正在为 ${IP_VERSION} 启动/重置防火墙...${NC}"; echo -e "${BLUE}正在清理所有现存的 IPTables 规则...${NC}"; $IPTABLES_CMD -F; $IPTABLES_CMD -X; $IPTABLES_CMD -Z; echo -e "${GREEN}✓ IPTables 规则已清空。${NC}"; echo -e "${BLUE}正在清理所有由本脚本创建的 IPSet...${NC}"; local sets_to_destroy; sets_to_destroy=($(ipset list 2>/dev/null | grep -oP '^Name: \Kgeo(block|whitelist)_[a-zA-Z0-9_]+')); if [ ${#sets_to_destroy[@]} -gt 0 ]; then for set in "${sets_to_destroy[@]}"; do ipset destroy "$set" &>/dev/null; done; echo -e "${GREEN}✓ 已清理 ${#sets_to_destroy[@]} 个旧的 IPSet。${NC}"; else echo -e "${GREEN}✓ 未发现需要清理的 IPSet。${NC}"; fi; echo -e "${BLUE}正在设置默认策略并创建新的规则链...${NC}"; $IPTABLES_CMD -P INPUT DROP; $IPTABLES_CMD -P FORWARD DROP; $IPTABLES_CMD -P OUTPUT ACCEPT; local chains_to_create=("WHITELIST" "BLACKLIST" "PORT_ALLOW" "PORT_DENY" "GEOBLOCK_IN" "GEOBLOCK_OUT" "GEOWHITELIST_IN" "GEOWHITELIST_OUT"); for chain in "${chains_to_create[@]}"; do $IPTABLES_CMD -N $chain; done; $IPTABLES_CMD -A INPUT -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT; $IPTABLES_CMD -A OUTPUT -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT; $IPTABLES_CMD -A INPUT -i lo -j ACCEPT; local ssh_port; ssh_port=$(sshd -T 2>/dev/null | grep -i '^port ' | awk '{print $2}' | head -n1); ssh_port=${ssh_port:-22}; if [[ "$IP_VERSION" == "IPv4" ]]; then echo -e "${YELLOW}正在将 SSH 端口 (${ssh_port}) 的放行规则强制插入到安全位置...${NC}"; $IPTABLES_CMD -I INPUT 3 -p tcp --dport "$ssh_port" -j ACCEPT; fi; if [ "$IPTABLES_CMD" == "ip6tables" ]; then echo -e "${YELLOW}正在为 IPv6 添加核心 ICMPv6 规则 (Neighbor Discovery)...${NC}"; $IPTABLES_CMD -A INPUT -p icmpv6 --icmpv6-type router-solicitation -j ACCEPT; $IPTABLES_CMD -A INPUT -p icmpv6 --icmpv6-type router-advertisement -j ACCEPT; $IPTABLES_CMD -A INPUT -p icmpv6 --icmpv6-type neighbor-solicitation -j ACCEPT; $IPTABLES_CMD -A INPUT -p icmpv6 --icmpv6-type neighbor-advertisement -j ACCEPT; fi; echo -e "${BLUE}正在构建优化的规则检查链条 (先拒绝, 后允许)...${NC}"; $IPTABLES_CMD -A INPUT -j WHITELIST; $IPTABLES_CMD -A INPUT -j BLACKLIST; $IPTABLES_CMD -A INPUT -j GEOBLOCK_IN; $IPTABLES_CMD -A INPUT -j GEOWHITELIST_IN; $IPTABLES_CMD -A INPUT -j PORT_ALLOW; $IPTABLES_CMD -A INPUT -j PORT_DENY; $IPTABLES_CMD -A OUTPUT -j GEOBLOCK_OUT; $IPTABLES_CMD -A OUTPUT -j GEOWHITELIST_OUT; echo -e "${GREEN}✓ ${IP_VERSION} 纯净防火墙逻辑已启动 (默认策略: DROP)。${NC}"; save_all_rules; if command -v docker &>/dev/null && systemctl is-active --quiet docker &>/dev/null; then echo -e "${YELLOW}为确保 Docker 网络规则兼容性，正在重启 Docker 服务...${NC}"; systemctl restart docker; echo -e "${GREEN}✓ Docker 服务已重启。${NC}"; fi; flush_connections_safely;
+      echo -e "${YELLOW}正在为 ${IP_VERSION} 启动/重置防火墙...${NC}"; echo -e "${BLUE}正在清理所有现存的 IPTables 规则...${NC}"; $IPTABLES_CMD -F; $IPTABLES_CMD -X; $IPTABLES_CMD -Z; echo -e "${GREEN}✓ IPTables 规则已清空。${NC}"; echo -e "${BLUE}正在清理所有由本脚本创建的 IPSet...${NC}"; local sets_to_destroy; sets_to_destroy=($(ipset list 2>/dev/null | grep -oP '^Name: \Kgeo(block|whitelist)_[a-zA-Z0-9_]+')); if [ ${#sets_to_destroy[@]} -gt 0 ]; then for set in "${sets_to_destroy[@]}"; do ipset destroy "$set" &>/dev/null; done; echo -e "${GREEN}✓ 已清理 ${#sets_to_destroy[@]} 个旧的 IPSet。${NC}"; else echo -e "${GREEN}✓ 未发现需要清理的 IPSet。${NC}"; fi; echo -e "${BLUE}正在设置默认策略并创建新的规则链...${NC}"; $IPTABLES_CMD -P INPUT DROP; $IPTABLES_CMD -P FORWARD DROP; $IPTABLES_CMD -P OUTPUT ACCEPT; local chains_to_create=("WHITELIST" "BLACKLIST" "PORT_ALLOW" "PORT_DENY" "GEOBLOCK_IN" "GEOBLOCK_OUT" "GEOWHITELIST_IN" "GEOWHITELIST_OUT"); for chain in "${chains_to_create[@]}"; do $IPTABLES_CMD -N $chain; done; $IPTABLES_CMD -A INPUT -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT; $IPTABLES_CMD -A OUTPUT -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT; $IPTABLES_CMD -A INPUT -i lo -j ACCEPT; local ssh_port; ssh_port=$(sshd -T 2>/dev/null | grep -i '^port ' | awk '{print $2}' | head -n1); ssh_port=${ssh_port:-22}; if [[ "$IP_VERSION" == "IPv4" ]]; then echo -e "${YELLOW}正在将 SSH 端口 (${ssh_port}) 的放行规则强制插入到安全位置...${NC}"; $IPTABLES_CMD -I INPUT 3 -p tcp --dport "$ssh_port" -j ACCEPT; fi; if [ "$IPTABLES_CMD" == "ip6tables" ]; then echo -e "${YELLOW}正在为 IPv6 添加核心 ICMPv6 规则 (Neighbor Discovery)...${NC}"; $IPTABLES_CMD -A INPUT -p icmpv6 --icmpv6-type router-solicitation -j ACCEPT; $IPTABLES_CMD -A INPUT -p icmpv6 --icmpv6-type router-advertisement -j ACCEPT; $IPTABLES_CMD -A INPUT -p icmpv6 --icmpv6-type neighbor-solicitation -j ACCEPT; $IPTABLES_CMD -A INPUT -p icmpv6 --icmpv6-type neighbor-advertisement -j ACCEPT; fi; echo -e "${BLUE}正在构建优化的规则检查链条 (先拒绝, 后允许)...${NC}"
+    # --- 为 INPUT 链挂载所有安检策略 ---
+    $IPTABLES_CMD -A INPUT -j WHITELIST
+    $IPTABLES_CMD -A INPUT -j BLACKLIST
+    $IPTABLES_CMD -A INPUT -j GEOWHITELIST_IN
+    $IPTABLES_CMD -A INPUT -j GEOBLOCK_IN
+    $IPTABLES_CMD -A INPUT -j PORT_DENY
+    $IPTABLES_CMD -A INPUT -j PORT_ALLOW
+
+    # --- 为 OUTPUT 链挂载出站安检策略 ---
+    $IPTABLES_CMD -A OUTPUT -j GEOBLOCK_OUT
+    $IPTABLES_CMD -A OUTPUT -j GEOWHITELIST_OUT
+
+    # --- 【核心修改】为 FORWARD 链挂载所有安检策略，实现对 Docker 的全面控制 ---
+    # 我们使用 -I 1 命令来插入，后执行的会成为新的第一条，所以要按优先级倒序添加
+     # --- 【最终方案】将安检策略挂载到 Docker 的官方“钩子”DOCKER-USER 链 ---
+    # 首先，确保 DOCKER-USER 链存在，如果不存在则创建它
+    $IPTABLES_CMD -N DOCKER-USER >/dev/null 2>&1
+    $IPTABLES_CMD -A DOCKER-USER -j WHITELIST
+    $IPTABLES_CMD -A DOCKER-USER -j BLACKLIST
+    $IPTABLES_CMD -A DOCKER-USER -j GEOWHITELIST_IN
+    $IPTABLES_CMD -A DOCKER-USER -j GEOBLOCK_IN
+    $IPTABLES_CMD -A DOCKER-USER -j PORT_DENY
+    $IPTABLES_CMD -A DOCKER-USER -j PORT_ALLOW
+    # 在 DOCKER-USER 链的末尾加上 RETURN，确保不匹配我们规则的流量能返回给 Docker 继续处理
+    $IPTABLES_CMD -A DOCKER-USER -j RETURN; echo -e "${GREEN}✓ ${IP_VERSION} 纯净防火墙逻辑已启动 (默认策略: DROP)。${NC}"; save_all_rules; if command -v docker &>/dev/null && systemctl is-active --quiet docker &>/dev/null; then echo -e "${YELLOW}为确保 Docker 网络规则兼容性，正在重启 Docker 服务...${NC}"; systemctl restart docker; echo -e "${GREEN}✓ Docker 服务已重启。${NC}"; fi; flush_connections_safely;
 }
 function load_or_initialize_firewall() { if [ -f /etc/debian_version ] && command -v netfilter-persistent &>/dev/null; then netfilter-persistent start &>/dev/null; elif [ -f /etc/redhat-release ] && command -v systemctl &>/dev/null; then systemctl is-active --quiet "$SAVE_SERVICE_NAME.service" || systemctl start "$SAVE_SERVICE_NAME.service" &>/dev/null; systemctl is-active --quiet "ipset.service" || systemctl start "ipset.service" &>/dev/null; else local rules_to_load=$RULES_FILE; if [ -f /etc/redhat-release ]; then rules_to_load=$RULES_FILE_RHEL; fi; if [ -f "$rules_to_load" ] && [ -s "$rules_to_load" ]; then "$IPTABLES_CMD-restore" < "$rules_to_load"; fi; fi; if ! $IPTABLES_CMD -L "GEOBLOCK_IN" &>/dev/null || ! $IPTABLES_CMD -L "GEOWHITELIST_IN" &>/dev/null ; then echo -e "${YELLOW}未找到防火墙核心架构，正在初始化...${NC}"; start_firewall; fi; }
 function stop_firewall() { echo -e "${YELLOW}正在停止 ${IP_VERSION} 防火墙...${NC}"; $IPTABLES_CMD -F; $IPTABLES_CMD -X; $IPTABLES_CMD -P INPUT ACCEPT; $IPTABLES_CMD -P FORWARD ACCEPT; $IPTABLES_CMD -P OUTPUT ACCEPT; echo -e "${RED}✓ ${IP_VERSION} 防火墙已停止。${NC}"; save_all_rules; flush_connections_safely; }
