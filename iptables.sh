@@ -40,7 +40,7 @@ F2B_CMD_PATH="/usr/local/bin/f2b"
 function select_protocol() {
     clear
     echo "======================================================"
-    echo "                           IPTables 防火墙管理器 V1.0"
+    echo "                           IPTables 防火墙管理器 V1.0)"
     echo "======================================================"
     echo "请选择您要管理的防火墙协议："
     echo " 1. IPv4"
@@ -694,7 +694,7 @@ function install_as_command() { echo -e "${BLUE}正在安装终端快捷命令..
 function uninstall_command() { echo -e "${YELLOW}正在卸载终端快捷命令...${NC}"; if [ -f "$SAFE_CMD_PATH" ]; then rm -f "$SAFE_CMD_PATH"; echo -e "${GREEN}✓ 已移除 'ipt' 命令。${NC}"; fi; if [ -f "$F2B_CMD_PATH" ]; then rm -f "$F2B_CMD_PATH"; echo -e "${GREEN}✓ 已移除 'f2b' 命令。${NC}"; fi; if [ -f "$SCRIPT_INSTALL_PATH" ]; then rm -f "$SCRIPT_INSTALL_PATH"; echo -e "${GREEN}✓ 已移除脚本主体。${NC}"; fi; echo -e "${GREEN}卸载完成。${NC}"; }
 function show_unified_menu() {
     local ssh_port; ssh_port=$(sshd -T 2>/dev/null | grep -i '^port ' | awk '{print $2}' | head -n1); ssh_port=${ssh_port:-22}; local icmp_status=$(check_icmp_status); local icmp_color="${RED}"; if [ "$icmp_status" == "允许" ]; then icmp_color="${GREEN}"; fi; local policy=$(check_default_policy); local policy_color="${GREEN}"; if [ "$policy" == "ACCEPT" ]; then policy_color="${RED}"; fi; local fwd_status=$(get_forwarding_status); local fwd_color="${RED}"; if [[ "$fwd_status" == "已开启" ]]; then fwd_color="${GREEN}"; fi; local fw_status=$(get_firewall_status); clear
-    echo "======================================================"; echo -e "       IPTables 防火墙管理器 (V40.3.2 - ${YELLOW}${IP_VERSION} 智能守护模式${NC})"; echo -e " (防火墙: ${fw_status} | SSH:${ssh_port} | 策略:${policy_color}${policy}${NC} | 转发:${fwd_color}${fwd_status}${NC})"; echo "======================================================"
+    echo "======================================================"; echo -e "       IPTables 防火墙管理器 (V1.0 ${YELLOW}${IP_VERSION} ${NC})"; echo -e " (防火墙: ${fw_status} | SSH:${ssh_port} | 策略:${policy_color}${policy}${NC} | 转发:${fwd_color}${fwd_status}${NC})"; echo "======================================================"
     echo -e "--- 主机防护 (INPUT) ---"; echo -e " 1. 新增 IP 到白名单"; echo -e " 2. 新增 IP 到黑名单"; echo -e " 3. 新增 [端口放行] 规则"; echo -e " 4. 新增 [端口封锁] 规则"; echo -e " 5. 黑白名单及端口策略删除"; echo -e " 6. ${BLUE}IP 封锁管理 (Geo-IP 黑名单)${NC}"; echo -e " 7. ${GREEN}IP 许可管理 (Geo-IP 白名单)${NC}"
     echo; echo -e "--- 出站管理 (OUTPUT) ---"; local menu_index=8; echo -e " ${menu_index}. 新增 OUTPUT 规则"; menu_index=$((menu_index+1)); echo -e " ${menu_index}. 删除 OUTPUT 规则"; menu_index=$((menu_index+1));
     # 删除了 FORWARD, NAT, Docker 的菜单项
