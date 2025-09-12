@@ -40,7 +40,7 @@ F2B_CMD_PATH="/usr/local/bin/f2b"
 function select_protocol() {
     clear
     echo "======================================================"
-    echo "                           IPTables 防火墙管理器 V40.3.2 (社区修正版)"
+    echo "                           IPTables 防火墙管理器 V1.0"
     echo "======================================================"
     echo "请选择您要管理的防火墙协议："
     echo " 1. IPv4"
