@@ -295,16 +295,28 @@ initialize_firewall() {
 
         nft add rule inet ${TABLE_NAME} ${USER_CHAIN} jump ${USER_IP_WHITELIST} comment "\"优先级1:IP白名单\""
         nft add rule inet ${TABLE_NAME} ${USER_CHAIN} jump ${USER_IP_BLACKLIST} comment "\"优先级2:IP黑名单\""
-        nft add rule inet ${TABLE_NAME} ${USER_CHAIN} jump ${USER_PORT_BLOCK} comment "\"优先级3:端口封锁\""
         nft add rule inet ${TABLE_NAME} ${USER_CHAIN} jump ${USER_PORT_ALLOW} comment "\"优先级4:端口放行\""
+        nft add rule inet ${TABLE_NAME} ${USER_CHAIN} jump ${USER_PORT_BLOCK} comment "\"优先级3:端口封锁\""
         
         # MODIFIED: SSH Whitelist sets are no longer created here.
         # They are now created as part of the Fail2ban table (`f2b-table`) setup.
 
         echo -e "${GREEN}防火墙已初始化为全新的多链安全架构。${NC}"
         nft list ruleset > ${NFT_CONF_PATH}
-        echo -e "\n${PURPLE}提示: 为确保系统重启后防火墙规则自动加载, 建议执行: systemctl enable nftables.service${NC}"
-        sleep 3
+        
+        # --- [修改] 将手动提示改为自动设置开机自启 ---
+        if ! systemctl is-enabled nftables.service &>/dev/null; then
+            echo -e "\n${YELLOW}--> 检测到 nftables 服务未设置开机自启, 正在为您自动设置...${NC}"
+            if systemctl enable nftables.service &>/dev/null; then
+                echo -e "${GREEN}  -> 设置成功! 防火墙规则将在系统重启后自动加载。${NC}"
+            else
+                echo -e "${RED}  -> 错误: 设置开机自启失败。您可能需要手动执行 'systemctl enable nftables.service'。${NC}"
+            fi
+        else
+            echo -e "\n${GREEN}--> nftables 服务已设置为开机自启, 无需操作。${NC}"
+        fi
+        sleep 2
+
     fi
     # MODIFIED: The compatibility check for old sets is no longer needed here.
     mkdir -p "${COUNTRY_IP_DIR}" "${CUSTOM_IP_DIR}"
@@ -823,11 +835,30 @@ reset_firewall() {
         initialize_firewall
         apply_and_save_changes 0 "重置防火墙" false "del_allow" "all" # 重置相当于删除所有允许规则
 
+        local f2b_handled=false
         if command -v fail2ban-client &>/dev/null; then
+            f2b_handled=true
             echo -e "\n${PURPLE}--- 联动修复 ---${NC}"
             echo -e "${CYAN}检测到 Fail2ban 已安装，将自动为您重新应用兼容性配置...${NC}"
             f2b_reapply_config
-        else
+        fi
+
+        # --- [新增] Docker 兼容性处理 ---
+        local docker_handled=false
+        if command -v docker &>/dev/null && systemctl is-active docker &>/dev/null; then
+            docker_handled=true
+            echo -e "\n${PURPLE}--- Docker 兼容性处理 ---${NC}"
+            echo -e "${CYAN}检测到 Docker 正在运行, 将重启服务以自动重建其防火墙规则...${NC}"
+            if systemctl restart docker; then
+                echo -e "${GREEN}Docker 重启成功。Docker 的网络规则已重新生成。${NC}"
+            else
+                echo -e "${RED}错误: Docker 服务重启失败。您可能需要手动重启。${NC}"
+            fi
+            press_any_key
+        fi
+
+        # 如果没有执行任何特殊处理（如f2b或docker），则在此处暂停
+        if ! $f2b_handled && ! $docker_handled; then
             press_any_key
         fi
     else
