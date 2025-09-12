@@ -259,20 +259,13 @@ ensure_ssh_whitelist_rules_exist() {
     # It is intentionally left empty.
     :
 }
-# ================= 复制下面的所有内容 =================
-
 initialize_firewall() {
     if ! nft list chain inet "${TABLE_NAME}" "${USER_CHAIN}" &>/dev/null; then
         echo -e "${YELLOW}未检测到防火墙规则或结构已旧, 正在进行初始化...${NC}"
         nft flush ruleset
         nft add table inet ${TABLE_NAME}
-
-        # --- 第一步: 创建所有需要的链 ---
         nft add chain inet ${TABLE_NAME} ${INPUT_CHAIN} '{ type filter hook input priority 0; policy drop; }'
         nft add chain inet ${TABLE_NAME} ${OUTPUT_CHAIN} '{ type filter hook output priority 0; policy accept; }'
-        # [修正] 创建 forward 链，用于管控 Docker
-        nft add chain inet ${TABLE_NAME} forward '{ type filter hook forward priority 0; policy accept; }'
-
         nft add chain inet ${TABLE_NAME} ${USER_CHAIN}
         nft add chain inet ${TABLE_NAME} ${USER_IP_WHITELIST}
         nft add chain inet ${TABLE_NAME} ${USER_IP_BLACKLIST}
@@ -281,7 +274,6 @@ initialize_firewall() {
         nft add chain inet ${TABLE_NAME} ${USER_OUT_IP_BLOCK}
         nft add chain inet ${TABLE_NAME} ${USER_OUT_PORT_BLOCK}
 
-        # --- 第二步: 在链中添加规则 (此时所有链都已存在) ---
         nft add rule inet ${TABLE_NAME} ${INPUT_CHAIN} ct state established,related accept comment "\"核心:允许已建立的连接\""
         nft add rule inet ${TABLE_NAME} ${INPUT_CHAIN} iifname lo accept comment "\"核心:允许本地回环接口\""
         nft add rule inet ${TABLE_NAME} ${INPUT_CHAIN} ip6 nexthdr icmpv6 accept comment "\"核心:允许核心ICMPv6功能\""
@@ -297,20 +289,15 @@ initialize_firewall() {
             nft add rule inet ${TABLE_NAME} ${INPUT_CHAIN} tcp dport 22 accept comment "\"核心:允许SSH(备用)\""
         fi
 
-        # [修正] 在所有用户链都创建完毕后，再添加跳转规则
         nft add rule inet ${TABLE_NAME} ${INPUT_CHAIN} jump ${USER_CHAIN} comment "\"跳转到用户入站规则主链\""
         nft add rule inet ${TABLE_NAME} ${OUTPUT_CHAIN} jump ${USER_OUT_IP_BLOCK} comment "\"跳转到用户出站IP黑名单\""
         nft add rule inet ${TABLE_NAME} ${OUTPUT_CHAIN} jump ${USER_OUT_PORT_BLOCK} comment "\"跳转到用户出站端口封锁\""
-
-        # [修正] 添加针对 Forward 链的规则
-        nft add rule inet ${TABLE_NAME} forward ct state established,related accept comment "\"核心:允许转发已建立的连接\""
-        nft add rule inet ${TABLE_NAME} forward jump ${USER_CHAIN} comment "\"跳转到用户规则进行Docker流量审查\""
 
         nft add rule inet ${TABLE_NAME} ${USER_CHAIN} jump ${USER_IP_WHITELIST} comment "\"优先级1:IP白名单\""
         nft add rule inet ${TABLE_NAME} ${USER_CHAIN} jump ${USER_IP_BLACKLIST} comment "\"优先级2:IP黑名单\""
         nft add rule inet ${TABLE_NAME} ${USER_CHAIN} jump ${USER_PORT_BLOCK} comment "\"优先级3:端口封锁\""
         nft add rule inet ${TABLE_NAME} ${USER_CHAIN} jump ${USER_PORT_ALLOW} comment "\"优先级4:端口放行\""
-
+        
         # MODIFIED: SSH Whitelist sets are no longer created here.
         # They are now created as part of the Fail2ban table (`f2b-table`) setup.
 
@@ -322,8 +309,6 @@ initialize_firewall() {
     # MODIFIED: The compatibility check for old sets is no longer needed here.
     mkdir -p "${COUNTRY_IP_DIR}" "${CUSTOM_IP_DIR}"
 }
-
-# ========================================================
 
 # --- IP集管理核心功能 ---
 process_downloaded_list() { local filepath=$1; local basename=$2; local type=$3; local set_name_v4="set_${type}_${basename}_v4"; local set_name_v6="set_${type}_${basename}_v6"; local v4_file="${filepath}.v4"; local v6_file="${filepath}.v6"; local batch_file="/tmp/nft_batch_$$_${RANDOM}.nft"; local chunk_prefix="/tmp/nft_chunk_$$_${RANDOM}_"; grep -v '^#' "$filepath" | grep -E '^([0-9]{1,3}\.){3}[0-9]{1,3}(/[0-9]{1,2})?$' > "$v4_file"; grep -v '^#' "$filepath" | grep ':' > "$v6_file"; if [ -s "$v4_file" ]; then echo -e "${CYAN}--> 正在处理IPv4 Set: ${set_name_v4}...${NC}"; if nft list set inet "${TABLE_NAME}" "${set_name_v4}" &>/dev/null; then echo -e "${YELLOW}    Set已存在, 正在清空...${NC}"; nft flush set inet "${TABLE_NAME}" "${set_name_v4}"; else echo -e "${GREEN}    Set不存在, 正在创建...${NC}"; nft add set inet "${TABLE_NAME}" "${set_name_v4}" '{ type ipv4_addr; flags interval; }'; fi; split -l 500 "$v4_file" "$chunk_prefix"; local all_ok=true; for chunk in ${chunk_prefix}*; do { echo -n "add element inet ${TABLE_NAME} ${set_name_v4} { "; tr '\n' ',' < "$chunk" | sed 's/,$//'; echo " }"; } > "$batch_file"; if ! nft -f "$batch_file"; then echo -e "${RED}    处理块 ${chunk##*_} 失败。${NC}"; all_ok=false; break; fi; done; if $all_ok; then echo -e "${GREEN}    IPv4 Set填充成功。${NC}"; else echo -e "${RED}    IPv4 Set填充失败。${NC}"; fi; rm -f ${chunk_prefix}*; fi; if [ -s "$v6_file" ]; then echo -e "${CYAN}--> 正在处理IPv6 Set: ${set_name_v6}...${NC}"; if nft list set inet "${TABLE_NAME}" "${set_name_v6}" &>/dev/null; then echo -e "${YELLOW}    Set已存在, 正在清空...${NC}"; nft flush set inet "${TABLE_NAME}" "${set_name_v6}"; else echo -e "${GREEN}    Set不存在, 正在创建...${NC}"; nft add set inet "${TABLE_NAME}" "${set_name_v6}" '{ type ipv6_addr; flags interval; }'; fi; split -l 500 "$v6_file" "$chunk_prefix"; local all_ok=true; for chunk in ${chunk_prefix}*; do { echo -n "add element inet ${TABLE_NAME} ${set_name_v6} { "; tr '\n' ',' < "$chunk" | sed 's/,$//'; echo " }"; } > "$batch_file"; if ! nft -f "$batch_file"; then echo -e "${RED}    处理块 ${chunk##*_} 失败。${NC}"; all_ok=false; break; fi; done; if $all_ok; then echo -e "${GREEN}    IPv6 Set填充成功。${NC}"; else echo -e "${RED}    IPv6 Set填充失败。${NC}"; fi; rm -f ${chunk_prefix}*; fi; rm -f "$v4_file" "$v6_file" "$batch_file"; echo -e "${GREEN}IP集处理完成。${NC}"; }
