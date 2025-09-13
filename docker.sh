@@ -1137,135 +1137,160 @@ manage_images() {
         esac
     done
 }
-# --- 容器更新功能 ---
+# --- 1. 全新的、“无交互”的、统一的后台安全重建引擎 ---
+# 这个函数只负责执行，不负责与用户交互
+recreate_container_engine() {
+    local container_id=$1; shift; local container_name=$1; shift;
+    # 接收整个参数数组
+    local -a run_cmd_args=("${@}")
+
+    # --- 安全更新流程 ---
+    log_info "1. 正在停止旧容器以释放端口..."
+    if ! docker stop "$container_id" > /dev/null; then
+        log_error "停止旧容器 '${container_name}' 失败！请检查容器状态。"
+        press_enter_to_continue; return 1;
+    fi
+
+    local backup_name="${container_name}_old_$(date +%s)"
+    log_info "2. 正在备份旧容器 (重命名为: ${backup_name})..."
+    if ! docker rename "$container_name" "$backup_name"; then
+        log_error "为旧容器重命名失败！"; docker start "$container_id" # 尝试恢复
+        press_enter_to_continue; return 1;
+    fi
+
+    log_info "3. 正在尝试使用新配置创建容器..."
+    local new_container_id; local error_output; local exit_code; local error_file; error_file=$(mktemp)
+    new_container_id=$(docker "${run_cmd_args[@]}" 2>"$error_file")
+    exit_code=$?
+    error_output=$(<"$error_file")
+    rm -f "$error_file"
+
+    if [ $exit_code -eq 0 ]; then
+        log_info "新容器已创建, 正在等待5秒进行健康检查..."
+        sleep 5
+        local new_status; new_status=$(docker inspect --format='{{.State.Status}}' "$new_container_id" 2>/dev/null)
+        if [[ "$new_status" == "running" ]]; then
+            log_success "4. 健康检查通过！新容器正在正常运行。"
+            log_info "5. 正在移除旧的备份容器..."
+            docker rm -f "$backup_name"
+            log_success "容器 '${container_name}' 重建成功！"
+            press_enter_to_continue; return 0;
+        else
+            log_error "4. 健康检查失败！新容器未能成功启动 (状态: ${new_status})。"
+        fi
+    else
+        log_error "创建新容器失败！错误信息:"; echo -e "${RED}${error_output}${RESET}"
+    fi
+
+    log_info "正在执行回滚操作..."
+    if [ -n "$new_container_id" ] && [[ "$(docker ps -a -q -f id="${new_container_id:0:12}")" ]]; then
+        log_info "  a. 正在移除失败的新容器..."; docker rm -f "$new_container_id"
+    fi
+    log_info "  b. 正在将旧容器恢复原名..."; if docker rename "$backup_name" "$container_name"; then
+        log_info "  c. 正在重新启动旧容器..."; docker start "$container_name"
+        log_success "回滚成功！服务已恢复到更新前的状态。"
+    else
+        log_error "致命错误：回滚失败！"; log_info "请手动执行: 'docker rename ${backup_name} ${container_name}' 并 'docker start ${container_name}'"
+    fi
+    press_enter_to_continue; return 1;
+}
+
+# --- 容器更新功能 (最终版：简洁流程 + 编辑选项 + 安全内核) ---
 update_container() {
     local container_id=$1; local container_name=$2; clear; log_header "更新容器: ${BLUE}${container_name}${RESET}"
-    log_info "此操作将: 1.拉取新镜像 2.停止并删除当前容器 3.用新镜像和旧配置重建容器。"
-    read -p "确定要更新容器 '${container_name}' 吗? (y/N): " confirm
+    log_info "此操作将: 1.拉取新镜像 2.让您预览并确认配置 3.安全地重建容器。"
+    read -p "确定要开始更新容器 '${container_name}' 吗? (y/N): " confirm
     if [[ ! "$confirm" =~ ^[yY]$ ]]; then log_info "已取消更新。"; press_enter_to_continue; return 1; fi
-    local inspect_json=$(docker inspect "$container_id"); local image_name=$(echo "$inspect_json" | jq -r '.[0].Config.Image'); local old_image_id=$(echo "$inspect_json" | jq -r '.[0].Image')
-    log_info "正在拉取最新镜像: ${image_name}..."; if ! docker pull "$image_name"; then log_error "镜像拉取失败。"; press_enter_to_continue; return 1; fi
-    local new_image_id=$(docker inspect --format='{{.Id}}' "$image_name")
+
+    local inspect_json; inspect_json=$(docker inspect "$container_id")
+    local image_name; image_name=$(echo "$inspect_json" | jq -r '.[0].Config.Image')
+    local old_image_id; old_image_id=$(echo "$inspect_json" | jq -r '.[0].Image')
+
+    log_info "正在拉取最新镜像: ${image_name}..."
+    if ! docker pull "$image_name"; then log_error "镜像拉取失败。"; press_enter_to_continue; return 1; fi
+    
+    local new_image_id; new_image_id=$(docker inspect --format='{{.Id}}' "$image_name")
     if [[ "$old_image_id" == "$new_image_id" ]]; then
-        log_info "镜像已经是最新版本。"; read -p "是否仍要强制使用当前镜像重建容器? (Y/n): " force_rebuild_choice
-        if [[ "$force_rebuild_choice" =~ ^[nN]$ ]]; then log_info "已取消重建容器。"; press_enter_to_continue; return 1; fi
-        log_info "用户选择强制重建容器..."
+        log_info "镜像已经是最新版本。"
+    else
+        log_success "镜像已成功更新到最新版本！"
     fi
-    log_info "正在根据旧容器配置生成新的启动命令..."; local run_cmd_args=(); run_cmd_args+=("run" "-d" "--name" "$container_name")
-    local policy_name=$(echo "$inspect_json" | jq -r '.[0].HostConfig.RestartPolicy.Name // "no"')
-    if [[ "$policy_name" != "no" && ! -z "$policy_name" ]]; then
-        local retry_count=$(echo "$inspect_json" | jq -r '.[0].HostConfig.RestartPolicy.MaximumRetryCount')
-        if [[ "$policy_name" == "on-failure" && "$retry_count" -gt 0 ]]; then run_cmd_args+=("--restart" "${policy_name}:${retry_count}"); else run_cmd_args+=("--restart" "$policy_name"); fi
-    fi
-    mapfile -t ports < <(echo "$inspect_json" | jq -r '.[0].HostConfig.PortBindings | to_entries[] | "-p", ((if .value[0].HostIp and .value[0].HostIp != "" then .value[0].HostIp + ":" else "" end) + .value[0].HostPort + ":" + .key)')
-    [ ${#ports[@]} -gt 0 ] && run_cmd_args+=("${ports[@]}")
+
+    log_info "正在根据旧容器配置生成新的启动命令..."
+    local run_cmd_args=(); run_cmd_args+=("run" "-d" "--name" "$container_name")
+    local policy_name; policy_name=$(echo "$inspect_json" | jq -r '.[0].HostConfig.RestartPolicy.Name // "no"'); if [[ "$policy_name" != "no" && ! -z "$policy_name" ]]; then local retry_count; retry_count=$(echo "$inspect_json" | jq -r '.[0].HostConfig.RestartPolicy.MaximumRetryCount'); if [[ "$policy_name" == "on-failure" && "$retry_count" -gt 0 ]]; then run_cmd_args+=("--restart" "${policy_name}:${retry_count}"); else run_cmd_args+=("--restart" "$policy_name"); fi; fi
+    mapfile -t ports < <(echo "$inspect_json" | jq -r '.[0].HostConfig.PortBindings | to_entries[] | "-p", ((if .value[0].HostIp and .value[0].HostIp != "" then .value[0].HostIp + ":" else "" end) + .value[0].HostPort + ":" + .key)'); [ ${#ports[@]} -gt 0 ] && run_cmd_args+=("${ports[@]}")
     mapfile -t mounts < <(echo "$inspect_json" | jq -r '.[0].Mounts[] | "-v", "\(.Source):\(.Destination)"'); [ ${#mounts[@]} -gt 0 ] && run_cmd_args+=("${mounts[@]}")
     mapfile -t envs < <(echo "$inspect_json" | jq -r '.[0].Config.Env[] | "-e", .'); [ ${#envs[@]} -gt 0 ] && run_cmd_args+=("${envs[@]}")
-    run_cmd_args+=("$image_name"); log_info "将要执行以下命令:"
-    printf "docker "; for arg in "${run_cmd_args[@]}"; do if [[ "$arg" == *" "* ]]; then printf "'%s' " "$arg"; else printf "%s " "$arg"; fi; done; echo
-    read -p "确认执行以上命令吗? (Y/n): " final_confirm
-    if [[ "$final_confirm" =~ ^[nN]$ ]]; then log_info "已取消执行。"; press_enter_to_continue; return 1; fi
-    log_info "正在停止旧容器..."; docker stop "$container_id" > /dev/null; log_info "正在删除旧容器..."; docker rm "$container_id" > /dev/null; log_info "正在创建并启动新容器..."
-    if docker "${run_cmd_args[@]}"; then log_success "容器更新成功！新容器已启动。"; else log_error "容器更新失败。请检查上面的命令和错误信息。"; fi
-    press_enter_to_continue; return 0
-}
-
-# --- 通用容器重建函数 ---
-recreate_container() {
-    local container_id=$1; shift
-    local container_name=$1; shift
-    local image_name=$1; shift
-    local restart_policy=$1; shift
-    
-    # 从管道符分隔的字符串中恢复数组
-    IFS='|' read -r -a ports <<< "$1"; shift
-    IFS='|' read -r -a volumes <<< "$1"; shift
-    IFS='|' read -r -a env_vars <<< "$1"; shift
-
-    local run_cmd_args=(); run_cmd_args+=("run" "-d" "--name" "$container_name")
-    
-    [[ -n "$restart_policy" && "$restart_policy" != "no" ]] && run_cmd_args+=("--restart" "$restart_policy")
-    
-    for port in "${ports[@]}"; do [[ -n "$port" ]] && run_cmd_args+=("-p" "$port"); done
-    for vol in "${volumes[@]}"; do [[ -n "$vol" ]] && run_cmd_args+=("-v" "$vol"); done
-    for env_var in "${env_vars[@]}"; do [[ -n "$env_var" ]] && run_cmd_args+=("-e" "$env_var"); done
-    
     run_cmd_args+=("$image_name")
     
-    clear; log_info "将根据您的配置执行以下命令:"
-    printf "docker "; for arg in "${run_cmd_args[@]}"; do if [[ "$arg" == *" "* ]]; then printf "'%s' " "$arg"; else printf "%s " "$arg"; fi; done; echo; echo
+    log_info "将要执行以下命令:"
+    printf "docker "; for arg in "${run_cmd_args[@]}"; do if [[ "$arg" == *" "* ]]; then printf "'%s' " "$arg"; else printf "%s " "$arg"; fi; done; echo
     
-    read -p "确认执行以上命令吗? (Y/n): " final_confirm
-    if [[ "$final_confirm" =~ ^[nN]$ ]]; then log_info "已取消执行。"; press_enter_to_continue; return 1; fi
+    # --- 核心修正点: 恢复 'e' 选项 ---
+    read -p "确认执行(Y), [e]编辑配置, 或 [n]取消? (Y/e/n): " final_confirm
     
-    log_info "正在停止旧容器..."; docker stop "$container_id" > /dev/null
-    log_info "正在删除旧容器..."; docker rm "$container_id" > /dev/null
-    log_info "正在创建并启动新容器..."
-    
-    if docker "${run_cmd_args[@]}"; then
-        log_success "容器编辑成功！新容器已启动。"
-    else
-        log_error "容器编辑失败。请检查上面的命令和错误信息。"
-    fi
-    press_enter_to_continue; return 0
+    case $final_confirm in
+        [eE])
+            # 如果用户选择编辑, 调用文件编辑功能
+            log_info "正在为您准备配置文件以供编辑..."
+            # edit_container_file 会调用安全的 recreate_container_engine
+            edit_container_file "$container_id" "$container_name" "$inspect_json" "$image_name"
+            return $?
+            ;;
+        [nN])
+            log_info "已取消执行。"; press_enter_to_continue; return 1
+            ;;
+        *)
+            # 用户选择 Y 或直接回车, 直接调用后台安全引擎执行
+            recreate_container_engine "$container_id" "$container_name" "${run_cmd_args[@]}"
+            return $?
+            ;;
+    esac
 }
 
-# --- 容器编辑功能 (配置文件模式) ---
+# --- 3. 修复后的容器编辑功能 (文件模式) ---
 edit_container_file() {
-    local container_id=$1; local container_name=$2; local inspect_json=$3; local temp_file; temp_file=$(mktemp "/tmp/docker_edit_${container_name}.XXXXXX.conf"); trap 'rm -f "$temp_file"' RETURN
-
-    # --- 1. 使用更简单、更健壮的格式生成配置文件 ---
-    # 直接使用jq生成 key="value" 格式的行
+    local container_id=$1; local container_name=$2; local inspect_json=$3;
+    local temp_file; temp_file=$(mktemp "/tmp/docker_edit_${container_name}.XXXXXX.conf"); trap 'rm -f "$temp_file"' RETURN
+    local image_to_use; image_to_use=$(echo "$inspect_json" | jq -r '.[0].Config.Image')
+    
     cat > "$temp_file" <<-EOF
 # Edit Docker Container Configuration
-# Please modify the parameters below. Save and exit to apply changes.
-# For multiple ports, volumes, or envs, simply add more lines in the format key="value".
-# -----------------------------------------------------------------
-image_name="$(echo "$inspect_json" | jq -r '.[0].Config.Image')"
+image_name="${image_to_use}"
 restart_policy="$(echo "$inspect_json" | jq -r '.[0].HostConfig.RestartPolicy.Name // "no"')"
-
 # --- Port Mappings (port="host:container") ---
 $(echo "$inspect_json" | jq -r '.[0].HostConfig.PortBindings | to_entries | .[] | "port=\"" + ((if .value[0].HostIp and .value[0].HostIp != "" then .value[0].HostIp + ":" else "" end) + .value[0].HostPort + ":" + .key) + "\""')
-
 # --- Volume Mappings (volume="/host:/container") ---
 $(echo "$inspect_json" | jq -r '.[0].Mounts[] | "volume=\"\(.Source):\(.Destination)\""')
-
 # --- Environment Variables (env_var="KEY=VALUE") ---
 $(echo "$inspect_json" | jq -r '.[0].Config.Env[] | "env_var=\"\(.)\""')
 EOF
 
-    local editor
-    editor=$(get_editor)
-    if [[ -z "$editor" ]]; then
-        log_error "系统中未找到可用的文本编辑器 (如 nano 或 vi)。"
-        press_enter_to_continue
-        return 1
-    fi
+    local editor; editor=$(get_editor)
+    if [[ -z "$editor" ]]; then log_error "未找到可用的文本编辑器。"; press_enter_to_continue; return 1; fi
     log_info "将在 3 秒后使用 '${editor}' 打开配置文件..."; sleep 3; $editor "$temp_file"
     if [ ! -s "$temp_file" ]; then log_info "配置文件为空，操作已取消。"; press_enter_to_continue; return 1; fi
     
-    # --- 2. 使用更简单、更健壮的 grep 和 cut 来解析文件 ---
-    # 为防止意外，先读取文件内容并处理可能存在的CRLF(Windows换行符)问题
-    local file_content
-    file_content=$(tr -d '\r' < "$temp_file")
-
+    local file_content; file_content=$(tr -d '\r' < "$temp_file")
     local new_image_name; new_image_name=$(echo "$file_content" | grep '^image_name=' | head -n 1 | cut -d'=' -f2- | sed 's/^"//;s/"$//')
     local new_restart_policy; new_restart_policy=$(echo "$file_content" | grep '^restart_policy=' | head -n 1 | cut -d'=' -f2- | sed 's/^"//;s/"$//')
-    
     mapfile -t new_ports < <(echo "$file_content" | grep '^port=' | cut -d'=' -f2- | sed 's/^"//;s/"$//')
     mapfile -t new_volumes < <(echo "$file_content" | grep '^volume=' | cut -d'=' -f2- | sed 's/^"//;s/"$//')
     mapfile -t new_env_vars < <(echo "$file_content" | grep '^env_var=' | cut -d'=' -f2- | sed 's/^"//;s/"$//')
 
-    # 将数组转换为管道符分隔的字符串以便传递
-    local ports_str; ports_str=$(printf "%s|" "${new_ports[@]}")
-    local volumes_str; volumes_str=$(printf "%s|" "${new_volumes[@]}")
-    local env_vars_str; env_vars_str=$(printf "%s|" "${new_env_vars[@]}")
-
-    recreate_container "$container_id" "$container_name" "$new_image_name" "$new_restart_policy" "$ports_str" "$volumes_str" "$env_vars_str"
+    local run_cmd_args=(); run_cmd_args+=("run" "-d" "--name" "$container_name")
+    [[ -n "$new_restart_policy" && "$new_restart_policy" != "no" ]] && run_cmd_args+=("--restart" "$new_restart_policy")
+    for port in "${new_ports[@]}"; do [[ -n "$port" ]] && run_cmd_args+=("-p" "$port"); done
+    for vol in "${new_volumes[@]}"; do [[ -n "$vol" ]] && run_cmd_args+=("-v" "$vol"); done
+    for env_var in "${new_env_vars[@]}"; do [[ -n "$env_var" ]] && run_cmd_args+=("-e" "$env_var"); done
+    run_cmd_args+=("$new_image_name")
+    
+    recreate_container_engine "$container_id" "$container_name" "${run_cmd_args[@]}"
     return $?
 }
 
-# --- 容器编辑功能 (交互式向导模式) ---
+# --- 4. 修复后的容器编辑功能 (交互式向导模式) ---
 edit_container_interactive() {
     local container_id=$1; local container_name=$2; local inspect_json=$3; local image_name=$(echo "$inspect_json" | jq -r '.[0].Config.Image'); local restart_policy=$(echo "$inspect_json" | jq -r '.[0].HostConfig.RestartPolicy.Name // "no"')
     mapfile -t ports < <(echo "$inspect_json" | jq -r '.[0].HostConfig.PortBindings | to_entries | .[] | ((if .value[0].HostIp and .value[0].HostIp != "" then .value[0].HostIp + ":" else "" end) + .value[0].HostPort + ":" + .key)')
@@ -1279,21 +1304,18 @@ edit_container_interactive() {
             2) read -p "请输入新的端口映射 (格式: 80:80 443:443) [当前: ${ports[*]}]: " -a new_ports; if [ ${#new_ports[@]} -gt 0 ]; then ports=("${new_ports[@]}"); fi;;
             3) read -p "请输入新的目录映射 (格式: /host:/app /data:/db) [当前: ${volumes[*]}]: " -a new_volumes; if [ ${#new_volumes[@]} -gt 0 ]; then volumes=("${new_volumes[@]}"); fi;;
             4) 
-                local temp_env_file; temp_env_file=$(mktemp "/tmp/docker_edit_env_${container_name}.XXXXXX.env"); trap 'rm -f "$temp_env_file"' RETURN; printf "%s\n" "${env_vars[@]}" > "$temp_env_file"
-                local editor
-                editor=$(get_editor)
-                if [[ -z "$editor" ]]; then
-                    log_error "系统中未找到可用的文本编辑器 (如 nano 或 vi)。"
-                    press_enter_to_continue
-                    continue
-                fi
+                local temp_env_file; temp_env_file=$(mktemp "/tmp/docker_edit_env_${container_name}.XXXXXX.env"); trap 'rm -f "$temp_env_file"' RETURN; printf "%s\n" "${env_vars[@]}" > "$temp_env_file"; local editor; editor=$(get_editor)
+                if [[ -z "$editor" ]]; then log_error "未找到可用的文本编辑器。"; press_enter_to_continue; continue; fi
                 log_info "将使用 '${editor}' 打开环境变量文件..."; sleep 2; $editor "$temp_env_file"; mapfile -t env_vars < "$temp_env_file";;
             [sS])
-                # 将数组转换为管道符分隔的字符串以便传递
-                local ports_str; ports_str=$(printf "%s|" "${ports[@]}")
-                local volumes_str; volumes_str=$(printf "%s|" "${volumes[@]}")
-                local env_vars_str; env_vars_str=$(printf "%s|" "${env_vars[@]}")
-                recreate_container "$container_id" "$container_name" "$image_name" "$restart_policy" "$ports_str" "$volumes_str" "$env_vars_str"
+                local run_cmd_args=(); run_cmd_args+=("run" "-d" "--name" "$container_name")
+                [[ -n "$restart_policy" && "$restart_policy" != "no" ]] && run_cmd_args+=("--restart" "$restart_policy")
+                for port in "${ports[@]}"; do [[ -n "$port" ]] && run_cmd_args+=("-p" "$port"); done
+                for vol in "${volumes[@]}"; do [[ -n "$vol" ]] && run_cmd_args+=("-v" "$vol"); done
+                for env_var in "${env_vars[@]}"; do [[ -n "$env_var" ]] && run_cmd_args+=("-e" "$env_var"); done
+                run_cmd_args+=("$image_name")
+                
+                recreate_container_engine "$container_id" "$container_name" "${run_cmd_args[@]}"
                 return $?;;
             [qQ]) log_info "已放弃修改。"; press_enter_to_continue; return 1;;
             *) log_error "无效输入，请重试。"; sleep 1;;
@@ -1410,7 +1432,7 @@ main_loop() {
     while true; do
         clear
         echo "============================================="
-        echo "      Docker 容器交互式管理工具 v10.19       " # 版本号+0.01
+        echo "      Docker 容器交互式管理工具 v1.0       " # 
         echo "============================================="
         
         # --- 彻底重构的排序和显示逻辑 ---
