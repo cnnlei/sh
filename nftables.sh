@@ -2766,11 +2766,13 @@ add_docker_rule_ip_based() {
     apply_and_save_changes $final_status "$entity_desc" "true" "$rule_type"
 }
 
+# [新版本] add_docker_rule_port_based (功能补全)
 add_docker_rule_port_based() {
     local action=$1
     local title=$2
     local target_chain=$3
     local final_status=0
+    local ip_input="" ip_type="" is_set=false
     local rule_type=""
     if [[ "$action" == "accept" ]]; then rule_type="add_allow"; else rule_type="add_block"; fi
     
@@ -2782,7 +2784,35 @@ add_docker_rule_port_based() {
         formatted_ports=$(validate_and_format_ports "$port_input")
         if [[ $? -eq 0 && -n "$formatted_ports" ]]; then break; else echo -e "${RED}输入无效或为空。${NC}"; fi
     done
-    
+
+    # --- 新增的IP选择逻辑 ---
+    echo -e "\n${CYAN}请选择此规则的IP来源:${NC}"
+    echo " 1) 所有IP (默认)"
+    echo " 2) 指定单个IP/网段"
+    echo " 3) 从已有的IP集中选择"
+    local choice_ip_source; read -p "#? (默认: 1): " choice_ip_source; choice_ip_source=${choice_ip_source:-1}
+    case $choice_ip_source in
+        2) 
+            local prompt="请输入来源IP地址或网段 ('q'返回): "
+            while true; do
+                read -p "$prompt" ip_input
+                if [[ $ip_input =~ ^[qQ]$ ]]; then echo -e "\n${YELLOW}操作已取消。${NC}"; sleep 1; return; fi
+                ip_type=$(validate_ip_or_cidr "$ip_input")
+                if [[ "$ip_type" != "invalid" ]]; then break; else echo -e "${RED}IP地址格式错误。${NC}"; fi
+            done
+            ;;
+        3) 
+            ip_input=$(select_from_ipset)
+            if [ $? -ne 0 ]; then echo -e "\n${YELLOW}操作已取消。${NC}"; sleep 1; return; fi
+            is_set=true
+            if [[ "$ip_input" == *_v6 ]] || [[ "$ip_input" == *_V6 ]]; then ip_type="ipv6"; else ip_type="ipv4"; fi
+            ;;
+        *) 
+            ip_input=""
+            ;;
+    esac
+    # --- IP选择逻辑结束 ---
+
     while true; do
         echo -e "\n${CYAN}请选择协议:${NC}"
         echo -e " 1) All (TCP+UDP) (默认)"
@@ -2803,11 +2833,28 @@ add_docker_rule_port_based() {
     if [[ $comment =~ ^[qQ]$ ]]; then echo -e "\n${YELLOW}操作已取消。${NC}"; sleep 1; return; fi
     
     local command_verb; if [[ "$action" == "accept" ]]; then command_verb="add"; else command_verb="insert"; fi
-    local entity_desc="${title} 端口:${port_input} [协议: ${protocol_desc}]"
+    local entity_desc="${title} 端口:${port_input}"
+    if [[ -n "$ip_input" ]]; then entity_desc+=" (IP来源:${ip_input})"; fi
+    entity_desc+=" [协议: ${protocol_desc}]"
     
     for proto in "${protocols_to_add[@]}"; do
         local full_comment="${comment:-${action^}_Port_$(echo "$port_input" | sed 's/,/_/g')}_${proto}_Docker}"
         local base_cmd_args=("nft" "${command_verb}" "rule" "inet" "${TABLE_NAME}" "${target_chain}")
+        
+        # --- 新增的命令构建逻辑 ---
+        if [[ -n "$ip_input" ]]; then
+            local ip_prop="saddr"
+            local ip_prefix="ip"
+            if [[ "$ip_type" == "ipv6" ]]; then ip_prefix="ip6"; fi
+            base_cmd_args+=("$ip_prefix" "$ip_prop")
+            if $is_set; then
+                base_cmd_args+=("@$ip_input")
+            else
+                base_cmd_args+=("$ip_input")
+            fi
+        fi
+        # --- 命令构建逻辑结束 ---
+
         base_cmd_args+=("$proto" "dport" "$formatted_ports" "$action" "comment" "\"$full_comment\"")
         
         echo -e "\n${YELLOW}执行命令: ${base_cmd_args[*]}${NC}"
@@ -2899,6 +2946,7 @@ toggle_docker_sync() {
     fi
 }
 
+# [新版本] edit_delete_docker_rule_visual (功能完整)
 edit_delete_docker_rule_visual() {
     local docker_chains=("${DOCKER_IP_WHITELIST}" "${DOCKER_IP_BLACKLIST}" "${DOCKER_PORT_DENY}" "${DOCKER_PORT_ALLOW}")
     
@@ -2930,10 +2978,7 @@ edit_delete_docker_rule_visual() {
                 local handle=$(echo "$rule" | awk '/handle/ {print $NF}')
                 if [[ -n "$handle" ]]; then
                     echo -e "${GREEN}[$i]${NC} $rule"
-                    local action=$(echo "$rule" | awk '{ for(j=1; j<=NF; j++) { if ($j == "accept" || $j == "drop") { print $j; break; } } }')
-                    local ports=$(echo "$rule" | grep -oP '(dport|sport)\s*\{?\s*[\d,-]+\s*\}?|(dport|sport)\s*\d+' | sed -E 's/(dport|sport)\s*\{?\s*//; s/\s*\}?//; s/,\s*/,/g')
                     all_rules_text+=("$rule"); all_rules_handle+=("$handle"); all_rules_chain+=("$chain_name")
-                    all_rules_action+=("$action"); all_rules_ports+=("$ports")
                     ((i++))
                 fi
             done
@@ -2950,7 +2995,6 @@ edit_delete_docker_rule_visual() {
         local action=$(echo "$action_input" | awk '{print tolower($1)}')
         local choices_str=$(echo "$action_input" | cut -d' ' -f2-)
         
-        # 为了简洁，此函数仅实现删除功能，移动和编辑可参考主函数 edit_delete_rule_visual
         case "$action" in
             da|deleteall)
                 read -p "警告: 您确定要删除所有 ${#all_rules_handle[@]} 条Docker独立规则吗? (y/N): " confirm
@@ -2985,8 +3029,96 @@ edit_delete_docker_rule_visual() {
                 apply_and_save_changes $final_success "删除 ${deleted_count} 条Docker规则" false
                 echo -e "${GREEN}操作完成, 正在刷新列表...${NC}"; sleep 1
                 ;;
+            m|move)
+                read -ra choices <<< "$choices_str"
+                if [ ${#choices[@]} -ne 1 ]; then
+                    echo -e "\n${RED}错误: '移动' 操作只需一个参数: 'm <要移动的规则编号>'。${NC}"; sleep 2; continue
+                fi
+                local source_choice=${choices[0]}
+                if ! [[ "$source_choice" =~ ^[0-9]+$ && "$source_choice" -ge 1 && "$source_choice" -le ${#all_rules_handle[@]} ]]; then
+                    echo -e "\n${RED}输入错误: '$source_choice' 不是一个有效的编号。${NC}"; sleep 2; continue
+                fi
+                
+                local source_index=$((source_choice-1))
+                local source_chain=${all_rules_chain[$source_index]}
+                local chain_start_idx=${chain_indices[$source_chain, "start"]}
+                local chain_end_idx=${chain_indices[$source_chain, "end"]}
+
+                clear
+                echo -e "${BLUE}--- 移动Docker规则 #${source_choice} ---${NC}"
+                echo -e "${YELLOW}当前规则:${NC} ${all_rules_text[$source_index]}"
+                echo -e "${CYAN}所在链:${NC} ${source_chain} (范围: #${chain_start_idx} - #${chain_end_idx})\n"
+                
+                echo -e "${PURPLE}--- 请选择移动方式 ---${NC}"
+                if [[ "$source_choice" -ne "$chain_start_idx" ]]; then echo -e " ${GREEN}t${NC}   - 置顶"; echo -e " ${GREEN}u${NC}   - 上移一位"; fi
+                if [[ "$source_choice" -ne "$chain_end_idx" ]]; then echo -e " ${GREEN}b${NC}   - 置底"; echo -e " ${GREEN}d${NC}   - 下移一位"; fi
+                echo -e " ${GREEN}bp <编号>${NC} - 移至规则 <编号> 之前"; echo -e " ${GREEN}ap <编号>${NC} - 移至规则 <编号> 之后";
+                echo -e "\n ${GREEN}q${NC} - 取消移动"; echo -e "${PURPLE}----------------------${NC}"
+                read -p "请输入移动指令: " move_cmd_input
+                if [[ $move_cmd_input =~ ^[qQ]$ ]]; then continue; fi
+
+                local move_action=$(echo "$move_cmd_input" | awk '{print tolower($1)}')
+                local dest_choice=$(echo "$move_cmd_input" | awk '{print $2}')
+                local source_handle=${all_rules_handle[$source_index]}
+                local rule_body=$(echo "${all_rules_text[$source_index]}" | sed 's/ handle [0-9]*$//')
+                local final_status=-1; local op_desc=""
+
+                # 使用修正后的移动逻辑
+                case "$move_action" in
+                    t|top)
+                        if [[ "$source_choice" -ne "$chain_start_idx" ]]; then
+                            local first_handle_in_chain=$(nft --handle list chain inet "${TABLE_NAME}" "${source_chain}" | awk '!/chain/ && /handle/ {print $NF; exit}')
+                            nft insert rule inet "${TABLE_NAME}" "${source_chain}" handle "${first_handle_in_chain}" ${rule_body} && final_status=0
+                            op_desc="置顶Docker规则 #${source_choice}"
+                        fi
+                        ;;
+                    b|bottom)
+                        if [[ "$source_choice" -ne "$chain_end_idx" ]]; then
+                            nft add rule inet "${TABLE_NAME}" "${source_chain}" ${rule_body} && final_status=0
+                            op_desc="置底Docker规则 #${source_choice}"
+                        fi
+                        ;;
+                    u|up)
+                        if [[ "$source_choice" -ne "$chain_start_idx" ]]; then
+                            local target_handle=${all_rules_handle[$((source_index-1))]}
+                            nft insert rule inet "${TABLE_NAME}" "${source_chain}" handle "${target_handle}" ${rule_body} && final_status=0
+                            op_desc="上移Docker规则 #${source_choice}"
+                        fi
+                        ;;
+                    d|down)
+                        if [[ "$source_choice" -ne "$chain_end_idx" ]]; then
+                            local target_handle=${all_rules_handle[$((source_index+1))]}
+                            nft add rule inet "${TABLE_NAME}" "${source_chain}" handle "${target_handle}" ${rule_body} && final_status=0
+                            op_desc="下移Docker规则 #${source_choice}"
+                        fi
+                        ;;
+                    bp|before|ap|after)
+                        if ! [[ "$dest_choice" =~ ^[0-9]+$ && "$dest_choice" -ge "$chain_start_idx" && "$dest_choice" -le "$chain_end_idx" ]]; then
+                             echo -e "\n${RED}目标编号 #${dest_choice} 无效或不在同一链内。${NC}"; sleep 2; continue
+                        fi
+                        if [[ "$source_choice" -eq "$dest_choice" ]]; then continue; fi
+                        local dest_index=$((dest_choice-1))
+                        local dest_handle=${all_rules_handle[$dest_index]}
+                        if [[ "$move_action" == "bp" || "$move_action" == "before" ]]; then
+                            nft insert rule inet "${TABLE_NAME}" "${source_chain}" handle ${dest_handle} ${rule_body} && final_status=0
+                            op_desc="移动Docker规则 #${source_choice} -> #${dest_choice} 之前"
+                        elif [[ "$move_action" == "ap" || "$move_action" == "after" ]]; then
+                            nft add rule inet "${TABLE_NAME}" "${source_chain}" handle ${dest_handle} ${rule_body} && final_status=0
+                            op_desc="移动Docker规则 #${source_choice} -> #${dest_choice} 之后"
+                        fi
+                        ;;
+                     *) echo -e "\n${RED}无效的移动指令。${NC}"; sleep 1; continue ;;
+                esac
+
+                if [[ "$final_status" -eq 0 ]]; then
+                    nft delete rule inet "${TABLE_NAME}" "${source_chain}" handle "${source_handle}"
+                    if [ $? -ne 0 ]; then final_status=1; fi
+                    apply_and_save_changes $final_status "$op_desc" false
+                elif [[ "$final_status" -eq 1 ]]; then echo -e "${RED}操作失败。${NC}"; fi
+                echo -e "${GREEN}操作完成, 正在刷新列表...${NC}"; sleep 1
+                ;;
             *)
-                echo -e "\n${RED}无效操作。此编辑器仅支持 'd' 和 'da'。${NC}"; sleep 2
+                echo -e "\n${RED}无效操作。${NC}"; sleep 2
                 ;;
         esac
     done
