@@ -67,6 +67,7 @@ case $PKG_MANAGER in
 esac;
 if ! check_and_install "python3" "python3"; then echo -e "${RED}Python 3 缺失, 脚本无法继续。${NC}"; exit 1; fi;
 PID_FILE="/tmp/http_server_pids.log"; touch $PID_FILE;
+IPERF_PID_FILE="/tmp/iperf3_server_pids.log"; touch $IPERF_PID_FILE;
 
 # --- All Main Functions ---
 
@@ -186,41 +187,191 @@ manage_http_server(){
 
 manage_iperf3(){
     if ! check_and_install "iperf3" "iperf3"; then return; fi;
-    while true; do
-        print_title "iperf3 网络性能测试"; echo -e "  ${YELLOW}1.${NC} 启动 iperf3 服务端"; echo -e "  ${YELLOW}2.${NC} 启动 iperf3 客户端"; echo -e "\n  ${RED}q.${NC} 返回"; echo ""; read -p "$(echo -e ${MAGENTA}"-> 选择: "${NC})" iperf_choice;
-        case $iperf_choice in
-            1) clear; echo -e "${YELLOW}正在后台启动 iperf3 服务端...${NC}"; pkill iperf3 2>/dev/null; iperf3 -s -D; echo -e "\n${GREEN}iperf3 服务端已在后台运行.${NC}"; echo -e "  - 使用 'pkill iperf3' 手动停止."; echo -e "  - 服务器IP: ${BOLD}$(hostname -I)${NC}"; read -p "...";;
-            2) clear; read -p "请输入 iperf3 服务器地址: " server_ip; echo ""; iperf3 -c $server_ip; read -p "$(echo -e "\n测试完成。按 Enter 返回...${NC}")";;
-            q) break;;
-            *) echo -e "\n${RED}无效选项!${NC}"; sleep 1;;
-        esac;
-    done;
-}
 
-edit_rc_local(){
     while true; do
-        print_title "rc.local 文件查看与编辑"; local RC_LOCAL_PATH="/etc/rc.local";
-        echo -e "  ${YELLOW}1.${NC} 查看 rc.local"; echo -e "  ${YELLOW}2.${NC} 编辑 rc.local (自动修复)"; echo -e "\n  ${RED}q.${NC} 返回"; echo ""; read -p "$(echo -e ${MAGENTA}"-> 选择: "${NC})" rc_choice;
-        case $rc_choice in
+        print_title "iperf3 网络性能测试 (高级版)";
+        echo -e "  ${YELLOW}1.${NC} 启动一个新的 iperf3 服务端";
+        echo -e "  ${YELLOW}2.${NC} 查看 / 停止正在运行的服务端";
+        echo -e "  ${YELLOW}3.${NC} 启动 iperf3 客户端进行测试";
+        echo -e "\n  ${RED}q.${NC} 返回主菜单";
+        echo "";
+        read -p "$(echo -e ${MAGENTA}"  -> 请选择: "${NC})" iperf_choice;
+
+        case $iperf_choice in
             1)
-                clear; print_title "查看 /etc/rc.local"; if [ -f "$RC_LOCAL_PATH" ]; then echo -e "${GREEN}--- 文件内容 ---${NC}"; cat -n "$RC_LOCAL_PATH"; else echo -e "${YELLOW}文件 ${RC_LOCAL_PATH} 不存在。${NC}"; fi;
-                read -p "$(echo -e "\n${YELLOW}按 Enter 返回...${NC}")";;
+                # --- 启动服务端 ---
+                print_title "启动新 iperf3 服务端";
+                read -p "请输入要监听的端口 [默认: 5201]: " port;
+                local PORT=${port:-5201};
+                if [[ ! "$PORT" =~ ^[0-9]+$ ]]; then echo -e "\n${RED}端口无效!${NC}"; sleep 2; continue; fi;
+
+                read -p "选择协议 (tcp/udp) [默认: tcp]: " protocol_choice;
+                local PROTOCOL=${protocol_choice:-tcp};
+                
+                read -p "是否为单次模式 (完成后自动退出)? (y/n) [默认: n]: " one_off_choice;
+                local ONE_OFF_MODE="持续运行";
+                local ONE_OFF_PARAM="";
+                if [[ "$one_off_choice" == "y" || "$one_off_choice" == "Y" ]]; then
+                    ONE_OFF_MODE="单次模式";
+                    ONE_OFF_PARAM="-1";
+                fi;
+
+                if [ -f "$IPERF_PID_FILE" ] && grep -q " $PORT " "$IPERF_PID_FILE" && kill -0 $(grep " $PORT " "$IPERF_PID_FILE" | awk '{print $1}') 2>/dev/null; then
+                    echo -e "\n${RED}端口 ${PORT} 已被此工具启动的服务占用!${NC}"; sleep 2; continue;
+                fi;
+
+                local IPERF_CMD="iperf3 -s -p $PORT $ONE_OFF_PARAM";
+                if [[ "$PROTOCOL" == "udp" ]]; then IPERF_CMD+=" -u"; fi;
+
+                local PID_FILE_PATH="/tmp/iperf3_server_${PORT}.pid";
+                echo -e "\n${YELLOW}正在后台启动 iperf3 服务端...${NC}";
+                echo -e "  ${CYAN}执行命令: $IPERF_CMD${NC}"
+                
+                $IPERF_CMD --pidfile "$PID_FILE_PATH" < /dev/null &> /dev/null &
+                sleep 1; 
+
+                if [ -f "$PID_FILE_PATH" ] && kill -0 $(cat "$PID_FILE_PATH") 2>/dev/null; then
+                    local pid=$(cat "$PID_FILE_PATH");
+                    # 记录 PID / 端口 / 协议 / 模式 / PID文件路径
+                    echo "$pid $PORT $PROTOCOL $ONE_OFF_MODE $PID_FILE_PATH" >> "$IPERF_PID_FILE";
+                    echo -e "\n${GREEN}iperf3 服务端启动成功!${NC}";
+                    echo -e "  - ${BOLD}PID     : ${pid}${NC}";
+                    echo -e "  - ${BOLD}监听端口: ${PORT}${NC}";
+                    echo -e "  - ${BOLD}协议    : ${PROTOCOL}${NC}";
+                    echo -e "  - ${BOLD}模式    : ${ONE_OFF_MODE}${NC}";
+                    echo -e "  - ${BOLD}服务器IP: $(hostname -I | awk '{print $1}')${NC}";
+                else
+                    echo -e "\n${RED}iperf3 服务端启动失败! 请检查端口是否被其他程序占用。${NC}";
+                    rm -f "$PID_FILE_PATH";
+                fi;
+                read -p "...";;
+
             2)
-                if ! check_and_install "nano" "nano"; then continue; fi;
-                print_title "编辑 rc.local 并修复服务"; local RC_LOCAL_SERVICE="rc-local.service"; local all_ok=true;
-                echo -e "${CYAN}1. 检查文件...${NC}";
-                if [ ! -f "$RC_LOCAL_PATH" ]; then
-                    echo -e "${YELLOW}   -> 文件不存在, 正在创建...${NC}"; (echo '#!/bin/bash'; echo 'exit 0') | $SUDO_CMD tee "$RC_LOCAL_PATH" > /dev/null; $SUDO_CMD chmod +x "$RC_LOCAL_PATH"; echo -e "${GREEN}   -> OK${NC}";
-                else echo -e "${GREEN}   -> 文件已存在。${NC}"; fi;
-                echo -e "\n${CYAN}2. 检查服务...${NC}";
-                if ! $SUDO_CMD systemctl is-enabled "$RC_LOCAL_SERVICE" &> /dev/null; then
-                    echo -e "${YELLOW}   -> 服务未启用, 正在配置...${NC}";
-                    local SERVICE_FILE_CONTENT="[Unit]\nDescription=/etc/rc.local Compatibility\nConditionFileIsExecutable=/etc/rc.local\nAfter=network.target\n\n[Service]\nType=forking\nExecStart=/etc/rc.local start\nTimeoutSec=0\nStandardOutput=tty\nRemainAfterExit=yes\n\n[Install]\nWantedBy=multi-user.target";
-                    echo -e "$SERVICE_FILE_CONTENT" | $SUDO_CMD tee "/etc/systemd/system/${RC_LOCAL_SERVICE}" > /dev/null; $SUDO_CMD systemctl daemon-reload;
-                    if $SUDO_CMD systemctl enable --now "$RC_LOCAL_SERVICE"; then echo -e "${GREEN}   -> OK${NC}"; else echo -e "${RED}   -> FAIL${NC}"; all_ok=false; fi;
-                else echo -e "${GREEN}   -> 服务已启用。${NC}"; fi;
-                if $all_ok; then echo -e "\n${GREEN}环境就绪...${NC}"; read -p "..."; $SUDO_CMD nano "$RC_LOCAL_PATH"; echo -e "\n${GREEN}OK${NC}"; else echo -e "\n${RED}环境修复失败。${NC}"; fi;
-                read -p "$(echo -e "\n${YELLOW}按 Enter 返回...${NC}")";;
+                # --- 查看/停止服务端 ---
+                while true; do
+                    print_title "查看 / 停止 iperf3 服务端";
+                    if [ -s "$IPERF_PID_FILE" ]; then
+                        temp_pid_file=$(mktemp);
+                        while read -r pid port protocol mode pid_path; do
+                            if kill -0 "$pid" 2>/dev/null; then
+                                echo "$pid $port $protocol $mode $pid_path" >> "$temp_pid_file";
+                            else
+                                rm -f "$pid_path"; 
+                            fi;
+                        done < "$IPERF_PID_FILE";
+                        mv "$temp_pid_file" "$IPERF_PID_FILE";
+                    fi;
+
+                    if [ ! -s "$IPERF_PID_FILE" ]; then
+                        echo -e "${YELLOW}没有由本工具启动的 iperf3 服务端正在运行。${NC}";
+                        read -p "..."; break;
+                    fi;
+
+                    echo -e "${CYAN}${BOLD}%-4s %-8s %-8s %-8s %-12s %-10s %s${NC}" "序号" "PID" "端口" "协议" "模式" "状态" "服务器 IP"
+                    echo -e "${CYAN}--------------------------------------------------------------------------------------${NC}";
+                    declare -a pids_map; declare -a pid_paths_map;
+                    local index=1;
+                    local server_ip=$(hostname -I | awk '{print $1}');
+                    while read -r pid port protocol mode pid_path; do
+                        printf "${GREEN}%-4s %-8s %-8s %-8s %-12s %-10s %s${NC}\n" "${index})" "$pid" "$port" "$protocol" "$mode" "运行中" "$server_ip"
+                        pids_map[$index]=$pid;
+                        pid_paths_map[$index]=$pid_path;
+                        index=$((index + 1));
+                    done < "$IPERF_PID_FILE";
+
+                    echo "";
+                    read -p "$(echo -e ${MAGENTA}"\n输入序号停止 (或 all), 或按 Enter 返回: "${NC})" input_to_kill;
+                    if [ -z "$input_to_kill" ]; then break; fi;
+
+                    if [[ "$input_to_kill" == "all" ]]; then
+                        echo -e "\n${YELLOW}正在停止所有 iperf3 服务端...${NC}";
+                        for i in "${!pids_map[@]}"; do kill "${pids_map[$i]}"; rm -f "${pid_paths_map[$i]}"; done;
+                        > "$IPERF_PID_FILE"; 
+                        echo -e "${GREEN}所有服务已停止!${NC}";
+                    else
+                        for i in $(echo $input_to_kill | tr ',' ' '); do
+                            if [[ "$i" =~ ^[0-9]+$ && -n "${pids_map[$i]}" ]]; then
+                                echo -e "${YELLOW}停止序号 ${i} (PID: ${pids_map[$i]})...${NC}";
+                                kill "${pids_map[$i]}"; rm -f "${pid_paths_map[$i]}";
+                                sed -i "/^${pids_map[$i]} /d" "$IPERF_PID_FILE";
+                            else
+                                echo -e "${RED}警告: 无效序号 '$i'。${NC}";
+                            fi;
+                        done;
+                        echo -e "${GREEN}所选服务已处理!${NC}";
+                    fi;
+                    sleep 2;
+                done;;
+
+            3)
+                # --- 启动客户端 ---
+                print_title "启动 iperf3 客户端测试";
+                read -p "请输入 iperf3 服务器地址: " server_ip;
+                if [ -z "$server_ip" ]; then echo -e "\n${RED}服务器地址不能为空!${NC}"; sleep 2; continue; fi;
+                
+                read -p "请输入服务器端口 [默认: 5201]: " server_port;
+                local SERVER_PORT=${server_port:-5201};
+
+                read -p "选择协议 (tcp/udp) [默认: tcp]: " protocol_choice;
+                local PROTOCOL=${protocol_choice:-tcp};
+                
+                # =======================> 新增的输入验证 <=======================
+                local DURATION
+                while true; do
+                    read -p "测试时长(秒) [1-86400, 默认: 10]: " duration_choice
+                    DURATION=${duration_choice:-10}
+                    if ! [[ "$DURATION" =~ ^[0-9]+$ ]]; then
+                        echo -e "\n${RED}错误: 请输入一个有效的数字。${NC}"
+                        continue
+                    fi
+                    if [ "$DURATION" -gt 86400 ]; then
+                        echo -e "\n${RED}错误: 测试时长过长, 最大不能超过 86400 秒 (24小时)。${NC}"
+                    else
+                        break
+                    fi
+                done
+                # ==============================================================
+
+                read -p "并行数据流数量 [默认: 1]: " parallel_choice;
+                local PARALLEL=${parallel_choice:-1};
+
+                read -p "是否启用反向模式 (服务器发送, 客户端接收)? (y/n) [默认: n]: " reverse_choice;
+                local REVERSE_PARAM="";
+                if [[ "$reverse_choice" == "y" || "$reverse_choice" == "Y" ]]; then
+                    REVERSE_PARAM="-R";
+                fi;
+
+                local IPERF_CMD="iperf3 -c $server_ip -p $SERVER_PORT -t $DURATION -P $PARALLEL $REVERSE_PARAM"
+                
+                if [[ "$PROTOCOL" == "udp" ]]; then
+                    IPERF_CMD+=" -u";
+                    local udp_bandwidth="";
+                    while [ -z "$udp_bandwidth" ]; do
+                        read -p "UDP 模式必须指定带宽 (如 10M, 1G): " udp_bandwidth;
+                    done
+                    IPERF_CMD+=" -b $udp_bandwidth";
+                fi;
+
+                echo "";
+                echo -e "${CYAN}------------------------------------------------------${NC}";
+                echo -e "${CYAN}            准备执行 iperf3 测试${NC}";
+                echo -e "${CYAN}------------------------------------------------------${NC}";
+                echo -e "  ${BOLD}服务器 :${NC} $server_ip:$SERVER_PORT";
+                echo -e "  ${BOLD}协议   :${NC} $PROTOCOL";
+                echo -e "  ${BOLD}时长   :${NC} ${DURATION}s";
+                echo -e "  ${BOLD}数据流 :${NC} $PARALLEL";
+                echo -e "  ${BOLD}方向   :${NC} ${REVERSE_PARAM:-- (默认: 上传)}";
+                echo -e "\n${YELLOW}完整命令: $IPERF_CMD${NC}\n";
+                
+                # 分开构建命令以处理UDP参数的空格问题
+                local final_params=("-c" "$server_ip" "-p" "$SERVER_PORT" "-t" "$DURATION" "-P" "$PARALLEL")
+                if [[ -n "$REVERSE_PARAM" ]]; then final_params+=("-R"); fi
+                if [[ "$PROTOCOL" == "udp" ]]; then final_params+=("-u" "-b" "$udp_bandwidth"); fi
+                
+                iperf3 "${final_params[@]}"
+
+                read -p "$(echo -e "\n测试完成。按 Enter 返回...${NC}")";;
+
             q) break;;
             *) echo -e "\n${RED}无效选项!${NC}"; sleep 1;;
         esac;
