@@ -2911,31 +2911,31 @@ toggle_docker_sync() {
             # 插入第一条规则到DOCKER_CHAIN链的顶部
             nft insert rule inet ${TABLE_NAME} ${DOCKER_CHAIN} jump ${USER_IP_WHITELIST} comment "\"SYNC: JUMP TO HOST WHITELIST\"" || final_status=1
             
-            # 【修复】使用精确的备注来查找上一条规则的句柄
             local last_handle=$(nft --handle list chain inet ${TABLE_NAME} ${DOCKER_CHAIN} | grep "SYNC: JUMP TO HOST WHITELIST" | head -n 1 | awk '{print $NF}')
             if [[ -n "$last_handle" ]]; then
                 nft add rule inet ${TABLE_NAME} ${DOCKER_CHAIN} handle ${last_handle} jump ${USER_IP_BLACKLIST} comment "\"SYNC: JUMP TO HOST BLACKLIST\"" || final_status=1
             else
-                echo -e "${RED}错误：无法定位上一条规则，中止操作。${NC}"; final_status=1
+                echo -e "${RED}错误：无法定位上一条规则(WHITELIST)，中止操作。${NC}"; final_status=1
             fi
 
+            ###【修复】交换了下面两条规则的顺序，确保 ALLOW 在 BLOCK 之前 ###
             if [[ "$final_status" -eq 0 ]]; then
-                # 【修复】使用精确的备注来查找上一条规则的句柄
                 last_handle=$(nft --handle list chain inet ${TABLE_NAME} ${DOCKER_CHAIN} | grep "SYNC: JUMP TO HOST BLACKLIST" | head -n 1 | awk '{print $NF}')
                 if [[ -n "$last_handle" ]]; then
-                    nft add rule inet ${TABLE_NAME} ${DOCKER_CHAIN} handle ${last_handle} jump ${USER_PORT_BLOCK} comment "\"SYNC: JUMP TO HOST PORT BLOCK\"" || final_status=1
+                    # 先添加 ALLOW
+                    nft add rule inet ${TABLE_NAME} ${DOCKER_CHAIN} handle ${last_handle} jump ${USER_PORT_ALLOW} comment "\"SYNC: JUMP TO HOST PORT ALLOW\"" || final_status=1
                 else
-                    echo -e "${RED}错误：无法定位上一条规则，中止操作。${NC}"; final_status=1
+                    echo -e "${RED}错误：无法定位上一条规则(BLACKLIST)，中止操作。${NC}"; final_status=1
                 fi
             fi
 
             if [[ "$final_status" -eq 0 ]]; then
-                 # 【修复】使用精确的备注来查找上一条规则的句柄
-                last_handle=$(nft --handle list chain inet ${TABLE_NAME} ${DOCKER_CHAIN} | grep "SYNC: JUMP TO HOST PORT BLOCK" | head -n 1 | awk '{print $NF}')
+                last_handle=$(nft --handle list chain inet ${TABLE_NAME} ${DOCKER_CHAIN} | grep "SYNC: JUMP TO HOST PORT ALLOW" | head -n 1 | awk '{print $NF}')
                 if [[ -n "$last_handle" ]]; then
-                    nft add rule inet ${TABLE_NAME} ${DOCKER_CHAIN} handle ${last_handle} jump ${USER_PORT_ALLOW} comment "\"SYNC: JUMP TO HOST PORT ALLOW\"" || final_status=1
+                    # 最后添加 BLOCK
+                    nft add rule inet ${TABLE_NAME} ${DOCKER_CHAIN} handle ${last_handle} jump ${USER_PORT_BLOCK} comment "\"SYNC: JUMP TO HOST PORT BLOCK\"" || final_status=1
                 else
-                    echo -e "${RED}错误：无法定位上一条规则，中止操作。${NC}"; final_status=1
+                    echo -e "${RED}错误：无法定位上一条规则(PORT ALLOW)，中止操作。${NC}"; final_status=1
                 fi
             fi
 
