@@ -138,7 +138,13 @@ F2B_SSH_WHITELIST_SET_V4="F2B_SSH_WHITELIST_V4"; F2B_SSH_WHITELIST_SET_V6="F2B_S
 NFT_CONF_PATH="/etc/nftables.conf";
 COUNTRY_IP_DIR="/root/guojia"; CUSTOM_IP_DIR="/root/zd_ip";
 BACKUP_DIR="/root/nftables-backup";
-SHORTCUT_NAME="nftables";
+SHORTCUT_NAME="nftsh";
+# --- [新增] Docker 管理专用变量 ---
+DOCKER_USER_CHAIN="DOCKER-USER"
+DOCKER_USER_IP_WHITELIST="DOCKER_USER_IP_WHITELIST"
+DOCKER_USER_IP_BLACKLIST="DOCKER_USER_IP_BLACKLIST"
+DOCKER_USER_PORT_BLOCK="DOCKER_USER_PORT_BLOCK"
+DOCKER_USER_PORT_ALLOW="DOCKER_USER_PORT_ALLOW"
 
 # --- 辅助函数 ---
 press_any_key() { echo -e "\n${CYAN}请按任意键返回...${NC}"; read -n 1 -s -r; }
@@ -2321,6 +2327,8 @@ view_socat_rules() {
     done
 }
 
+
+
 socat_manager_menu() {
     while true; do
         clear
@@ -2601,7 +2609,425 @@ shortcut_manager_menu() {
     done
 }
 
-# --- 主菜单与循环 ---
+# =================================================================
+#
+# ### 开始: Docker v1.2 网络管理模块的完整代码 ###
+#
+# =================================================================
+
+# --- [新] 全局变量定义 (请将这部分添加到脚本顶部的全局变量区) ---
+FORWARD_CHAIN="forward";
+DOCKER_CHAIN="DOCKER_FILTER_CHAIN";
+DOCKER_IP_WHITELIST="DOCKER_IP_WHITELIST";
+DOCKER_IP_BLACKLIST="DOCKER_IP_BLACKLIST";
+DOCKER_PORT_ALLOW="DOCKER_PORT_ALLOW";
+DOCKER_PORT_DENY="DOCKER_PORT_DENY";
+
+# --- [新] initialize_firewall 函数 (请用这个版本完整替换您现有的同名函数) ---
+initialize_firewall() {
+    if ! nft list chain inet "${TABLE_NAME}" "${USER_CHAIN}" &>/dev/null; then
+        echo -e "${YELLOW}未检测到防火墙规则或结构已旧, 正在进行初始化...${NC}"
+        nft flush ruleset
+        nft add table inet ${TABLE_NAME}
+        
+        # --- 创建核心链 (Input, Output, Forward) ---
+        nft add chain inet ${TABLE_NAME} ${INPUT_CHAIN} '{ type filter hook input priority filter; policy drop; }'
+        nft add chain inet ${TABLE_NAME} ${OUTPUT_CHAIN} '{ type filter hook output priority filter; policy accept; }'
+        nft add chain inet ${TABLE_NAME} ${FORWARD_CHAIN} '{ type filter hook forward priority filter; policy accept; }'
+
+        # --- 创建用户自定义链 (主机入站) ---
+        nft add chain inet ${TABLE_NAME} ${USER_CHAIN}
+        nft add chain inet ${TABLE_NAME} ${USER_IP_WHITELIST}
+        nft add chain inet ${TABLE_NAME} ${USER_IP_BLACKLIST}
+        nft add chain inet ${TABLE_NAME} ${USER_PORT_BLOCK}
+        nft add chain inet ${TABLE_NAME} ${USER_PORT_ALLOW}
+        
+        # --- 创建用户自定义链 (主机出站) ---
+        nft add chain inet ${TABLE_NAME} ${USER_OUT_IP_BLOCK}
+        nft add chain inet ${TABLE_NAME} ${USER_OUT_PORT_BLOCK}
+        
+        # --- 创建Docker过滤专用链 ---
+        nft add chain inet ${TABLE_NAME} ${DOCKER_CHAIN}
+        nft add chain inet ${TABLE_NAME} ${DOCKER_IP_WHITELIST}
+        nft add chain inet ${TABLE_NAME} ${DOCKER_IP_BLACKLIST}
+        nft add chain inet ${TABLE_NAME} ${DOCKER_PORT_ALLOW}
+        nft add chain inet ${TABLE_NAME} ${DOCKER_PORT_DENY}
+
+        # --- 配置核心INPUT链规则 ---
+        nft add rule inet ${TABLE_NAME} ${INPUT_CHAIN} ct state established,related accept comment "\"核心:允许已建立的连接\""
+        nft add rule inet ${TABLE_NAME} ${INPUT_CHAIN} iifname lo accept comment "\"核心:允许本地回环接口\""
+        nft add rule inet ${TABLE_NAME} ${INPUT_CHAIN} ip6 nexthdr icmpv6 accept comment "\"核心:允许核心ICMPv6功能\""
+        nft add rule inet ${TABLE_NAME} ${INPUT_CHAIN} ip protocol icmp icmp type echo-request accept comment "\"Allow IPv4 Ping\""
+        
+        # 动态获取并允许SSH端口
+        local ssh_ports_to_add=$(ss -tlpn "sport = :*" 2>/dev/null | grep 'sshd' | grep -oE ':[0-9]+' | sed 's/://g' | sort -u | tr '\n' ',' | sed 's/,$//')
+        if [[ -n "$ssh_ports_to_add" ]]; then
+            if [[ "$ssh_ports_to_add" == *,* ]]; then
+                nft add rule inet ${TABLE_NAME} ${INPUT_CHAIN} tcp dport "{ ${ssh_ports_to_add} }" accept comment "\"核心:允许SSH\""
+            else
+                nft add rule inet ${TABLE_NAME} ${INPUT_CHAIN} tcp dport "$ssh_ports_to_add" accept comment "\"核心:允许SSH\""
+            fi
+        else
+            nft add rule inet ${TABLE_NAME} ${INPUT_CHAIN} tcp dport 22 accept comment "\"核心:允许SSH(备用)\""
+        fi
+
+        # --- 配置链跳转逻辑 ---
+        # INPUT 流量跳转到用户规则
+        nft add rule inet ${TABLE_NAME} ${INPUT_CHAIN} jump ${USER_CHAIN} comment "\"跳转到用户入站规则主链\""
+        
+        # OUTPUT 流量跳转到出站规则
+        nft add rule inet ${TABLE_NAME} ${OUTPUT_CHAIN} jump ${USER_OUT_IP_BLOCK} comment "\"跳转到用户出站IP黑名单\""
+        nft add rule inet ${TABLE_NAME} ${OUTPUT_CHAIN} jump ${USER_OUT_PORT_BLOCK} comment "\"跳转到用户出站端口封锁\""
+        
+        # FORWARD 流量 (Docker) 跳转到Docker过滤链
+        local docker_interfaces=$(ip -o link show type bridge | awk -F': ' '/docker|br-/ {print $2}' | cut -d'@' -f1 | tr '\n' ' ' | sed 's/ $//')
+        if [[ -n "$docker_interfaces" ]]; then
+            echo -e "${CYAN}检测到Docker网络接口: ${docker_interfaces}, 正在自动添加转发过滤规则...${NC}"
+            nft add rule inet ${TABLE_NAME} ${FORWARD_CHAIN} oifname { $(echo ${docker_interfaces} | tr ' ' ',') } jump ${DOCKER_CHAIN} comment "\"跳转到Docker过滤链\""
+        fi
+
+        # --- 配置用户规则链内部优先级 ---
+        nft add rule inet ${TABLE_NAME} ${USER_CHAIN} jump ${USER_IP_WHITELIST} comment "\"优先级1:IP白名单\""
+        nft add rule inet ${TABLE_NAME} ${USER_CHAIN} jump ${USER_IP_BLACKLIST} comment "\"优先级2:IP黑名单\""
+        nft add rule inet ${TABLE_NAME} ${USER_CHAIN} jump ${USER_PORT_ALLOW} comment "\"优先级4:端口放行\""
+        nft add rule inet ${TABLE_NAME} ${USER_CHAIN} jump ${USER_PORT_BLOCK} comment "\"优先级3:端口封锁\""
+        
+        # --- 配置Docker过滤链内部优先级 ---
+        nft add rule inet ${TABLE_NAME} ${DOCKER_CHAIN} jump ${DOCKER_IP_WHITELIST} comment "\"Docker优先级1:IP白名单\""
+        nft add rule inet ${TABLE_NAME} ${DOCKER_CHAIN} jump ${DOCKER_IP_BLACKLIST} comment "\"Docker优先级2:IP黑名单\""
+        nft add rule inet ${TABLE_NAME} ${DOCKER_CHAIN} jump ${DOCKER_PORT_ALLOW} comment "\"Docker优先级4:端口允许\""
+        nft add rule inet ${TABLE_NAME} ${DOCKER_CHAIN} jump ${DOCKER_PORT_DENY} comment "\"Docker优先级3:端口拒绝\""
+        
+        echo -e "${GREEN}防火墙已初始化为全新的多链安全架构 (已包含Docker支持)。${NC}"
+        nft list ruleset > ${NFT_CONF_PATH}
+        
+        if ! systemctl is-enabled nftables.service &>/dev/null; then
+            echo -e "\n${YELLOW}--> 检测到 nftables 服务未设置开机自启, 正在为您自动设置...${NC}"
+            if systemctl enable nftables.service &>/dev/null; then
+                echo -e "${GREEN}  -> 设置成功! 防火墙规则将在系统重启后自动加载。${NC}"
+            else
+                echo -e "${RED}  -> 错误: 设置开机自启失败。您可能需要手动执行 'systemctl enable nftables.service'。${NC}"
+            fi
+        else
+            echo -e "\n${GREEN}--> nftables 服务已设置为开机自启, 无需操作。${NC}"
+        fi
+        sleep 2
+    fi
+    mkdir -p "${COUNTRY_IP_DIR}" "${CUSTOM_IP_DIR}"
+}
+
+# --- [新] Docker 网络管理模块的独立函数 ---
+add_docker_rule_ip_based() {
+    local action=$1
+    local title=$2
+    local target_chain=$3
+    local rule_ip_prop="saddr"
+    local ip_input=""; local is_set=false; local final_status=0
+    local ip_type=""; local rule_type=""
+    if [[ "$action" == "accept" ]]; then rule_type="add_allow"; else rule_type="add_block"; fi
+    
+    clear; echo -e "${BLUE}--- ${title} ---${NC}\n"
+    echo -e "${CYAN}请选择操作对象:${NC}"
+    echo " 1) 手动输入IP/网段 (默认)"
+    echo " 2) 从已有的IP集中选择"
+    local choice_obj; read -p "#? (默认: 1): " choice_obj; choice_obj=${choice_obj:-1}
+    
+    local prompt="请输入源IP地址或网段 ('q'返回): "
+    if [[ "$choice_obj" == "2" ]]; then
+        ip_input=$(select_from_ipset)
+        if [ $? -ne 0 ]; then echo -e "\n${YELLOW}操作已取消。${NC}"; sleep 1; return; fi
+        is_set=true
+        if [[ "$ip_input" == *_v6 ]] || [[ "$ip_input" == *_V6 ]]; then ip_type="ipv6"; else ip_type="ipv4"; fi
+    else
+        while true; do
+            read -p "$prompt" ip_input
+            if [[ $ip_input =~ ^[qQ]$ ]]; then echo -e "\n${YELLOW}操作已取消。${NC}"; sleep 1; return; fi
+            ip_type=$(validate_ip_or_cidr "$ip_input")
+            if [[ "$ip_type" != "invalid" ]]; then break; else echo -e "${RED}IP地址格式错误。${NC}"; fi
+        done
+    fi
+    
+    read -p "请输入备注 (可选, 'q'取消): " comment
+    if [[ $comment =~ ^[qQ]$ ]]; then echo -e "\n${YELLOW}操作已取消。${NC}"; sleep 1; return; fi
+    
+    local base_cmd=("nft" "insert" "rule" "inet" "${TABLE_NAME}" "${target_chain}")
+    local entity_desc="${title} ${ip_input}"
+    
+    local cmd_args=("${base_cmd[@]}"); local ip_prefix="ip"
+    if [[ "$ip_type" == "ipv6" ]]; then ip_prefix="ip6"; fi
+    
+    if $is_set; then cmd_args+=("$ip_prefix" "$rule_ip_prop" "@$ip_input"); else cmd_args+=("$ip_prefix" "$rule_ip_prop" "$ip_input"); fi
+    
+    local rule_comment="${comment:-Rule_for_${ip_input}_Docker}"
+    cmd_args+=("$action" "comment" "\"$rule_comment\"")
+    echo -e "\n${YELLOW}执行: ${cmd_args[*]}${NC}"
+    "${cmd_args[@]}"; final_status=$?
+    
+    apply_and_save_changes $final_status "$entity_desc" "true" "$rule_type"
+}
+
+add_docker_rule_port_based() {
+    local action=$1
+    local title=$2
+    local target_chain=$3
+    local final_status=0
+    local rule_type=""
+    if [[ "$action" == "accept" ]]; then rule_type="add_allow"; else rule_type="add_block"; fi
+    
+    clear; echo -e "${BLUE}--- ${title} ---${NC}\n"
+    while true; do
+        echo -e "${CYAN}支持格式 - 单个:80, 多个:80,443, 范围:1000-2000${NC}"
+        read -p "请输入要操作的端口 (输入 'q' 返回): " port_input
+        if [[ $port_input =~ ^[qQ]$ ]]; then echo -e "\n${YELLOW}操作已取消。${NC}"; sleep 1; return; fi
+        formatted_ports=$(validate_and_format_ports "$port_input")
+        if [[ $? -eq 0 && -n "$formatted_ports" ]]; then break; else echo -e "${RED}输入无效或为空。${NC}"; fi
+    done
+    
+    while true; do
+        echo -e "\n${CYAN}请选择协议:${NC}"
+        echo -e " 1) All (TCP+UDP) (默认)"
+        echo -e " 2) TCP"
+        echo -e " 3) UDP"
+        echo -e " q) 返回"
+        read -p "#? (默认: 1. All): " choice; choice=${choice:-1}
+        case $choice in
+            1) protocols_to_add=("tcp" "udp"); protocol_desc="TCP+UDP"; break;;
+            2) protocols_to_add=("tcp"); protocol_desc="TCP"; break;;
+            3) protocols_to_add=("udp"); protocol_desc="UDP"; break;;
+            [qQ]) echo -e "\n${YELLOW}操作已取消。${NC}"; sleep 1; return;;
+            *) echo -e "${RED}无效选择。${NC}";;
+        esac
+    done
+    
+    read -p "请输入备注 (可选, 'q'取消): " comment
+    if [[ $comment =~ ^[qQ]$ ]]; then echo -e "\n${YELLOW}操作已取消。${NC}"; sleep 1; return; fi
+    
+    local command_verb; if [[ "$action" == "accept" ]]; then command_verb="add"; else command_verb="insert"; fi
+    local entity_desc="${title} 端口:${port_input} [协议: ${protocol_desc}]"
+    
+    for proto in "${protocols_to_add[@]}"; do
+        local full_comment="${comment:-${action^}_Port_$(echo "$port_input" | sed 's/,/_/g')}_${proto}_Docker}"
+        local base_cmd_args=("nft" "${command_verb}" "rule" "inet" "${TABLE_NAME}" "${target_chain}")
+        base_cmd_args+=("$proto" "dport" "$formatted_ports" "$action" "comment" "\"$full_comment\"")
+        
+        echo -e "\n${YELLOW}执行命令: ${base_cmd_args[*]}${NC}"
+        "${base_cmd_args[@]}"
+        if [ $? -ne 0 ]; then final_status=1; fi
+    done
+    
+    apply_and_save_changes $final_status "$entity_desc" "true" "$rule_type" "$port_input"
+}
+
+get_docker_sync_status() {
+    if nft list chain inet ${TABLE_NAME} ${DOCKER_CHAIN} 2>/dev/null | grep -q "SYNC: JUMP TO HOST"; then
+        echo -e "${GREEN}(当前: 同步中)${NC}"
+    else
+        echo -e "${RED}(当前: 未同步)${NC}"
+    fi
+}
+
+# [请用此代码块完整替换旧的 toggle_docker_sync 函数]
+toggle_docker_sync() {
+    clear
+    local status_text=$(get_docker_sync_status)
+    echo -e "${BLUE}--- 同步主防火墙规则到Docker过滤链 ---${NC}\n"
+    echo -e "当前状态: ${status_text}\n"
+    
+    if [[ "$status_text" == *同步中* ]]; then
+        echo -e "${YELLOW}您确定要取消将主防火墙规则同步到Docker吗?${NC}"
+        echo -e "取消后，只有在Docker防火墙中单独添加的规则会生效。"
+        read -p "确认取消同步吗? (y/N): " confirm
+        if [[ "$confirm" =~ ^[yY]$ ]]; then
+            local handles=$(nft --handle list chain inet ${TABLE_NAME} ${DOCKER_CHAIN} | grep "SYNC: JUMP TO HOST" | awk '{print $NF}')
+            if [[ -z "$handles" ]]; then
+                echo -e "${YELLOW}未找到可取消的同步规则。可能已被手动删除。${NC}"; press_any_key; return
+            fi
+            # 从后往前删除，避免handle变化导致错误
+            for handle in $(echo "$handles" | sort -nr); do
+                nft delete rule inet ${TABLE_NAME} ${DOCKER_CHAIN} handle $handle
+            done
+            apply_and_save_changes $? "取消Docker与主规则同步"
+        else
+            echo -e "${GREEN}操作已取消。${NC}"; press_any_key
+        fi
+    else
+        echo -e "${YELLOW}您确定要将主防火墙的以下规则同步应用到Docker吗?${NC}"
+        echo -e "  - IP白名单 (${USER_IP_WHITELIST})"
+        echo -e "  - IP黑名单 (${USER_IP_BLACKLIST})"
+        echo -e "  - 端口封锁 (${USER_PORT_BLOCK})"
+        echo -e "  - 端口放行 (${USER_PORT_ALLOW})"
+        echo -e "\n这将使您对主机的访问控制策略同样对Docker容器生效。"
+        read -p "确认启用同步吗? (y/N): " confirm
+        if [[ "$confirm" =~ ^[yY]$ ]]; then
+            local final_status=0
+            
+            # 插入第一条规则到DOCKER_CHAIN链的顶部
+            nft insert rule inet ${TABLE_NAME} ${DOCKER_CHAIN} jump ${USER_IP_WHITELIST} comment "\"SYNC: JUMP TO HOST WHITELIST\"" || final_status=1
+            
+            # 【修复】使用精确的备注来查找上一条规则的句柄
+            local last_handle=$(nft --handle list chain inet ${TABLE_NAME} ${DOCKER_CHAIN} | grep "SYNC: JUMP TO HOST WHITELIST" | head -n 1 | awk '{print $NF}')
+            if [[ -n "$last_handle" ]]; then
+                nft add rule inet ${TABLE_NAME} ${DOCKER_CHAIN} handle ${last_handle} jump ${USER_IP_BLACKLIST} comment "\"SYNC: JUMP TO HOST BLACKLIST\"" || final_status=1
+            else
+                echo -e "${RED}错误：无法定位上一条规则，中止操作。${NC}"; final_status=1
+            fi
+
+            if [[ "$final_status" -eq 0 ]]; then
+                # 【修复】使用精确的备注来查找上一条规则的句柄
+                last_handle=$(nft --handle list chain inet ${TABLE_NAME} ${DOCKER_CHAIN} | grep "SYNC: JUMP TO HOST BLACKLIST" | head -n 1 | awk '{print $NF}')
+                if [[ -n "$last_handle" ]]; then
+                    nft add rule inet ${TABLE_NAME} ${DOCKER_CHAIN} handle ${last_handle} jump ${USER_PORT_BLOCK} comment "\"SYNC: JUMP TO HOST PORT BLOCK\"" || final_status=1
+                else
+                    echo -e "${RED}错误：无法定位上一条规则，中止操作。${NC}"; final_status=1
+                fi
+            fi
+
+            if [[ "$final_status" -eq 0 ]]; then
+                 # 【修复】使用精确的备注来查找上一条规则的句柄
+                last_handle=$(nft --handle list chain inet ${TABLE_NAME} ${DOCKER_CHAIN} | grep "SYNC: JUMP TO HOST PORT BLOCK" | head -n 1 | awk '{print $NF}')
+                if [[ -n "$last_handle" ]]; then
+                    nft add rule inet ${TABLE_NAME} ${DOCKER_CHAIN} handle ${last_handle} jump ${USER_PORT_ALLOW} comment "\"SYNC: JUMP TO HOST PORT ALLOW\"" || final_status=1
+                else
+                    echo -e "${RED}错误：无法定位上一条规则，中止操作。${NC}"; final_status=1
+                fi
+            fi
+
+            apply_and_save_changes $final_status "启用Docker与主规则同步"
+        else
+            echo -e "${GREEN}操作已取消。${NC}"; press_any_key
+        fi
+    fi
+}
+
+edit_delete_docker_rule_visual() {
+    local docker_chains=("${DOCKER_IP_WHITELIST}" "${DOCKER_IP_BLACKLIST}" "${DOCKER_PORT_DENY}" "${DOCKER_PORT_ALLOW}")
+    
+    while true; do
+        clear
+        echo -e "${BLUE}--- 删除/排序/编辑 Docker 独立规则 ---${NC}\n"
+        local i=1
+        all_rules_text=(); all_rules_handle=(); all_rules_chain=()
+        all_rules_action=(); all_rules_ports=()
+        declare -A chain_indices
+
+        echo -e "${CYAN}当前可操作的所有 Docker 独立规则:${NC}"
+        for chain_name in "${docker_chains[@]}"; do
+            if ! nft list chain inet ${TABLE_NAME} "${chain_name}" &>/dev/null; then continue; fi
+            local all_lines_in_chain=()
+            mapfile -t all_lines_in_chain < <(nft --handle list chain inet ${TABLE_NAME} "${chain_name}")
+            
+            local rules_in_chain=()
+            for line in "${all_lines_in_chain[@]}"; do
+                if ! [[ "$line" =~ ^[[:space:]]*chain ]]; then rules_in_chain+=("$line"); fi
+            done
+            
+            if [ ${#rules_in_chain[@]} -eq 0 ]; then continue; fi
+
+            echo -e "${PURPLE}--- Chain: ${chain_name} (规则 #${i} 到 #$((i + ${#rules_in_chain[@]} - 1))) ---${NC}"
+            chain_indices[$chain_name, "start"]=$i
+            
+            for rule in "${rules_in_chain[@]}"; do
+                local handle=$(echo "$rule" | awk '/handle/ {print $NF}')
+                if [[ -n "$handle" ]]; then
+                    echo -e "${GREEN}[$i]${NC} $rule"
+                    local action=$(echo "$rule" | awk '{ for(j=1; j<=NF; j++) { if ($j == "accept" || $j == "drop") { print $j; break; } } }')
+                    local ports=$(echo "$rule" | grep -oP '(dport|sport)\s*\{?\s*[\d,-]+\s*\}?|(dport|sport)\s*\d+' | sed -E 's/(dport|sport)\s*\{?\s*//; s/\s*\}?//; s/,\s*/,/g')
+                    all_rules_text+=("$rule"); all_rules_handle+=("$handle"); all_rules_chain+=("$chain_name")
+                    all_rules_action+=("$action"); all_rules_ports+=("$ports")
+                    ((i++))
+                fi
+            done
+            chain_indices[$chain_name, "end"]=$((i-1))
+        done
+
+        if [ ${#all_rules_handle[@]} -eq 0 ]; then
+            echo -e "\n${YELLOW}没有独立的 Docker 规则可供操作。${NC}"; press_any_key; break
+        fi
+
+        echo -e "\n${CYAN}操作提示: 'd <编号>'(删除), 'm <编号>'(移动), 'da'(全删), 'q'(返回).${NC}"
+        read -p "请输入您的操作和编号: " action_input
+        if [[ $action_input =~ ^[qQ]$ ]]; then break; fi
+        local action=$(echo "$action_input" | awk '{print tolower($1)}')
+        local choices_str=$(echo "$action_input" | cut -d' ' -f2-)
+        
+        # 为了简洁，此函数仅实现删除功能，移动和编辑可参考主函数 edit_delete_rule_visual
+        case "$action" in
+            da|deleteall)
+                read -p "警告: 您确定要删除所有 ${#all_rules_handle[@]} 条Docker独立规则吗? (y/N): " confirm
+                if [[ "$confirm" =~ ^[yY]$ ]]; then
+                    for chain_name in "${docker_chains[@]}"; do nft flush chain inet "${TABLE_NAME}" "$chain_name"; done
+                    apply_and_save_changes 0 "删除所有Docker独立规则" false "del_allow" "all"
+                    echo -e "${GREEN}所有规则已删除, 正在刷新...${NC}"; sleep 1
+                else
+                    echo -e "\n${YELLOW}操作已取消。${NC}"; sleep 1
+                fi
+                continue
+                ;;
+            d|delete)
+                read -ra choices <<< "$choices_str"
+                if [ ${#choices[@]} -eq 0 ]; then echo -e "\n${RED}输入为空或未提供编号。${NC}"; sleep 1; continue; fi
+                local valid_choices=true
+                for choice in "${choices[@]}"; do
+                    if ! [[ "$choice" =~ ^[0-9]+$ && "$choice" -ge 1 && "$choice" -le ${#all_rules_handle[@]} ]]; then
+                        echo -e "\n${RED}输入错误: '$choice' 不是一个有效的编号。${NC}"; sleep 2; valid_choices=false; break
+                    fi
+                done
+                if ! $valid_choices; then continue; fi
+                local sorted_choices=($(for i in "${choices[@]}"; do echo "$i"; done | sort -nur))
+                local final_success=0; local deleted_count=0
+                for choice in "${sorted_choices[@]}"; do
+                    local index=$((choice-1))
+                    local handle_to_delete=${all_rules_handle[$index]}
+                    local chain_to_delete_from=${all_rules_chain[$index]}
+                    nft delete rule inet "${TABLE_NAME}" "${chain_to_delete_from}" handle "${handle_to_delete}"
+                    if [ $? -eq 0 ]; then ((deleted_count++)); else final_success=1; fi
+                done
+                apply_and_save_changes $final_success "删除 ${deleted_count} 条Docker规则" false
+                echo -e "${GREEN}操作完成, 正在刷新列表...${NC}"; sleep 1
+                ;;
+            *)
+                echo -e "\n${RED}无效操作。此编辑器仅支持 'd' 和 'da'。${NC}"; sleep 2
+                ;;
+        esac
+    done
+}
+
+docker_network_manager_menu() {
+    while true; do
+        clear
+        local sync_status=$(get_docker_sync_status)
+        echo -e "${PURPLE}======================================================${NC}"
+        echo -e "                              ${CYAN}Docker 网络管理中心 (v1.2 Arch)${NC}"
+        echo -e "${PURPLE}======================================================${NC}"
+        echo -e "${YELLOW}在这里添加的规则将只对转发到Docker容器的流量生效。${NC}"
+        echo -e " ${GREEN}1.${NC} 同步主防火墙规则 ${sync_status}"
+        echo -e " ${GREEN}2.${NC} 添加Docker白名单IP (Whitelist)"
+        echo -e " ${GREEN}3.${NC} 添加Docker黑名单IP (Blacklist)"
+        echo -e " ${GREEN}4.${NC} 添加Docker允许访问的端口 (Port Allow)"
+        echo -e " ${GREEN}5.${NC} 添加Docker拒绝访问的端口 (Port Deny)"
+        echo -e " ${GREEN}6.${NC} ${RED}查看/删除 Docker独立规则${NC}"
+        echo -e "\n ${GREEN}q.${NC} 返回主菜单"
+        echo -e "${PURPLE}------------------------------------------------------${NC}"
+        read -p "请输入您的选项: " choice
+        case $choice in
+            1) toggle_docker_sync ;;
+            2) add_docker_rule_ip_based "accept" "Docker IP 白名单" "${DOCKER_IP_WHITELIST}" ;;
+            3) add_docker_rule_ip_based "drop" "Docker IP 黑名单" "${DOCKER_IP_BLACKLIST}" ;;
+            4) add_docker_rule_port_based "accept" "Docker 端口放行" "${DOCKER_PORT_ALLOW}" ;;
+            5) add_docker_rule_port_based "drop" "Docker 端口拒绝" "${DOCKER_PORT_DENY}" ;;
+            6) edit_delete_docker_rule_visual ;;
+            q|Q) break ;;
+            *) echo -e "\n${RED}无效选项。${NC}"; sleep 1 ;;
+        esac
+    done
+}
+
+# =================================================================
+#
+# ### 结束: Docker v1.2 模块代码 ###
+#
+# =================================================================
+
 main_menu() {
     local policy_input=$(nft list chain inet ${TABLE_NAME} ${INPUT_CHAIN} 2>/dev/null | grep -o 'policy \w*' | awk '{print $2}')
     local policy_output=$(nft list chain inet ${TABLE_NAME} ${OUTPUT_CHAIN} 2>/dev/null | grep -o 'policy \w*' | awk '{print $2}')
@@ -2618,48 +3044,30 @@ main_menu() {
         autostart_status="${RED}未自启${NC}"
     fi
     
-    # --- 智能 Ping 状态检测逻辑 ---
-local ipv4_ping_status
-local ipv4_ping_status_text
-
-# (变量 policy_input 在此函数前面部分已经获取，这里直接使用)
-if [[ "$policy_input" == "drop" ]]; then
-    # 在 policy drop 模式下，必须有明确的 accept 规则才算放行
-    if nft list ruleset | grep -q 'comment "Allow IPv4 Ping"'; then
-        ipv4_ping_status="${GREEN}已放行${NC}"
-        ipv4_ping_status_text="${GREEN}允许${NC}"
-    else
-        ipv4_ping_status="${RED}已阻断${NC}"
-        ipv4_ping_status_text="${RED}阻断${NC}"
+    local ipv4_ping_status; local ipv4_ping_status_text
+    if [[ "$policy_input" == "drop" ]]; then
+        if nft list ruleset | grep -q 'comment "Allow IPv4 Ping"'; then
+            ipv4_ping_status="${GREEN}已放行${NC}"; ipv4_ping_status_text="${GREEN}允许${NC}"
+        else
+            ipv4_ping_status="${RED}已阻断${NC}"; ipv4_ping_status_text="${RED}阻断${NC}"
+        fi
+    else 
+        if nft list ruleset | grep -q 'comment "Block IPv4 Ping (Policy-Accept-Mode)"'; then
+            ipv4_ping_status="${RED}已阻断${NC}"; ipv4_ping_status_text="${RED}阻断${NC}"
+        else
+            ipv4_ping_status="${GREEN}已放行${NC}"; ipv4_ping_status_text="${GREEN}允许${NC}"
+        fi
     fi
-else # policy 为 accept 的情况
-    # 在 policy accept 模式下，必须有明确的 drop 规则才算阻断
-    if nft list ruleset | grep -q 'comment "Block IPv4 Ping (Policy-Accept-Mode)"'; then
-        ipv4_ping_status="${RED}已阻断${NC}"
-        ipv4_ping_status_text="${RED}阻断${NC}"
-    else
-        ipv4_ping_status="${GREEN}已放行${NC}"
-        ipv4_ping_status_text="${GREEN}允许${NC}"
-    fi
-fi
-# --- 智能检测逻辑结束 ---
 
     local ssh_port_info
     ssh_port_info=$(ss -tlpn 2>/dev/null | grep 'sshd' | grep -E '(\*|0\.0\.0\.0|\[::\]):[0-9]+' | grep -oE ':[0-9]+' | sed 's/://g' | sort -u | tr '\n' ',' | sed 's/,$//')
-    if [[ -z "$ssh_port_info" ]]; then
-        ssh_port_info="${YELLOW}未知${NC}"
-    else
-        ssh_port_info="${GREEN}${ssh_port_info}${NC}"
-    fi
+    if [[ -z "$ssh_port_info" ]]; then ssh_port_info="${YELLOW}未知${NC}"; else ssh_port_info="${GREEN}${ssh_port_info}${NC}"; fi
 
-    local policy_input_color
-    local policy_menu_status
+    local policy_input_color; local policy_menu_status
     if [[ "$policy_input" == "drop" ]]; then
-        policy_input_color="${YELLOW}"
-        policy_menu_status="(当前: ${GREEN}drop${NC})"
+        policy_input_color="${YELLOW}"; policy_menu_status="(当前: ${GREEN}drop${NC})"
     else
-        policy_input_color="${RED}"
-        policy_menu_status="(当前: ${RED}accept(危险)${NC})"
+        policy_input_color="${RED}"; policy_menu_status="(当前: ${RED}accept(危险)${NC})"
     fi
     
     local shortcut_status_text="(状态: ${RED}未安装${NC})"
@@ -2669,42 +3077,39 @@ fi
     
     local f2b_status_text
     if command -v fail2ban-client &>/dev/null; then
-        if systemctl is-active --quiet fail2ban; then
-            f2b_status_text="(状态: ${GREEN}运行中${NC})"
-        else
-            f2b_status_text="(状态: ${YELLOW}已停止${NC})"
-        fi
+        if systemctl is-active --quiet fail2ban; then f2b_status_text="(状态: ${GREEN}运行中${NC})"; else f2b_status_text="(状态: ${YELLOW}已停止${NC})"; fi
     else
         f2b_status_text="(状态: ${RED}未安装${NC})"
     fi
 
     clear
     echo -e "${PURPLE}======================================================${NC}"
-    echo -e "        ${CYAN}NFTables 防火墙管理器 (By cnyun.de v 1.0)${NC}"
+    echo -e "         ${CYAN}NFTables 防火墙管理器 (By cnyun.de v 1.0)${NC}"
     echo -e "${PURPLE}--------------------[ 系统状态 ]----------------------${NC}"
     echo -e " 入站策略: ${policy_input_color}${policy_input}${NC}  | 出站策略: ${YELLOW}${policy_output}${NC}  | 转发: ${forward_status}"
     echo -e " 开机自启: ${autostart_status} | Ping(IPv4): ${ipv4_ping_status} | SSH端口: ${ssh_port_info}"
     echo -e "${PURPLE}======================================================${NC}"
-    echo -e "${BLUE}--- 规则管理 (入站) ---${NC}"
-    echo -e " ${GREEN}1.${NC} 新增 IP 到入站白名单"
-    echo -e " ${GREEN}2.${NC} ${YELLOW}新增 IP 到入站黑名单${NC}"
-    echo -e " ${GREEN}3.${NC} ${YELLOW}新增 [入站端口封禁] 规则${NC}"
-    echo -e " ${GREEN}4.${NC} 新增 [入站端口放行] 规则"
+    echo -e "${BLUE}--- 规则管理 (主机) ---${NC}"
+    echo -e " ${GREEN}1.${NC} 新增 IP 到主机白名单"
+    echo -e " ${GREEN}2.${NC} ${YELLOW}新增 IP 到主机黑名单${NC}"
+    echo -e " ${GREEN}3.${NC} ${YELLOW}新增 [主机端口封禁] 规则${NC}"
+    echo -e " ${GREEN}4.${NC} 新增 [主机端口放行] 规则"
     echo -e " ${GREEN}5.${NC} IP 集管理 (国家/自定义)"
-    echo -e " ${GREEN}6.${NC} ${RED}查看/删除/编辑/排序 用户规则 (终极灵活版)${NC}"
-    echo -e "\n${BLUE}--- 转发 & 出站 ---${NC}"
+    echo -e " ${GREEN}6.${NC} ${RED}查看/删除/编辑/排序 主机规则${NC}"
+    echo -e "\n${BLUE}--- 转发 & 容器 ---${NC}"
     echo -e " ${GREEN}7.${NC} ${YELLOW}新增 [出站IP/端口] 封锁${NC}"
     echo -e " ${GREEN}8.${NC} ${YELLOW}轻量级端口转发 (socat)${NC}"
+    echo -e " ${GREEN}9.${NC} ${CYAN}Docker 网络管理${NC}"
     echo -e "\n${BLUE}--- 系统 & 监控 & 附加功能 ---${NC}"
-    echo -e " ${GREEN}9.${NC} ${CYAN}查看完整防火墙状态${NC}"
-    echo -e " ${GREEN}10.${NC} ${YELLOW}超级网络监控 (多维度实时视图)${NC}"
-    echo -e " ${GREEN}11.${NC} ${RED}重置防火墙为默认结构${NC}"
-    echo -e " ${GREEN}12.${NC} ${YELLOW}清除连接状态 (Conntrack)${NC}"
-    echo -e " ${GREEN}13.${NC} 切换 IPv4 ICMP (Ping) 状态 (当前: ${ipv4_ping_status_text})"
-    echo -e " ${GREEN}14.${NC} ${RED}切换默认入站策略${NC} ${policy_menu_status}"
-    echo -e " ${GREEN}15.${NC} ${CYAN}Fail2ban与SSH综合管理${NC} ${f2b_status_text}"
-    echo -e " ${GREEN}16.${NC} ${YELLOW}备份与恢复规则${NC}"
-    echo -e " ${GREEN}17.${NC} ${YELLOW}终端快捷方式管理${NC} ${shortcut_status_text}"
+    echo -e " ${GREEN}10.${NC} ${CYAN}查看完整防火墙状态${NC}"
+    echo -e " ${GREEN}11.${NC} ${YELLOW}超级网络监控 (多维度实时视图)${NC}"
+    echo -e " ${GREEN}12.${NC} ${RED}重置防火墙为默认结构${NC}"
+    echo -e " ${GREEN}13.${NC} ${YELLOW}清除连接状态 (Conntrack)${NC}"
+    echo -e " ${GREEN}14.${NC} 切换 IPv4 ICMP (Ping) 状态 (当前: ${ipv4_ping_status_text})"
+    echo -e " ${GREEN}15.${NC} ${RED}切换默认入站策略${NC} ${policy_menu_status}"
+    echo -e " ${GREEN}16.${NC} ${CYAN}Fail2ban与SSH综合管理${NC} ${f2b_status_text}"
+    echo -e " ${GREEN}17.${NC} ${YELLOW}备份与恢复规则${NC}"
+    echo -e " ${GREEN}18.${NC} ${YELLOW}终端快捷方式管理${NC} ${shortcut_status_text}"
     echo -e "\n${PURPLE}------------------------------------------------------${NC}"
     echo -e " ${GREEN}q.${NC} 退出脚本"
     echo -e "${PURPLE}------------------------------------------------------${NC}"
@@ -2715,10 +3120,10 @@ while true; do
     main_menu
     read -p "请输入您的选项: " choice
     case $choice in
-        1) add_rule_ip_based "in" "accept" "入站IP白名单" ;;
-        2) add_rule_ip_based "in" "drop" "入站IP黑名单" ;;
-        3) add_rule_port_based "in" "drop" "入站端口封锁" ;;
-        4) add_rule_port_based "in" "accept" "入站端口放行" ;;
+        1) add_rule_ip_based "in" "accept" "主机IP白名单" ;;
+        2) add_rule_ip_based "in" "drop" "主机IP黑名单" ;;
+        3) add_rule_port_based "in" "drop" "主机端口封锁" ;;
+        4) add_rule_port_based "in" "accept" "主机端口放行" ;;
         5) ipset_manager_menu ;;
         6) edit_delete_rule_visual ;;
         7) 
@@ -2735,15 +3140,16 @@ while true; do
             esac
             ;;
         8) socat_manager_menu ;;
-        9) view_full_status ;;
-        10) detailed_network_monitor_menu ;;
-        11) reset_firewall ;;
-        12) clear_connections ;;
-        13) toggle_ipv4_ping ;;
-        14) toggle_default_policy ;;
-        15) fail2ban_ssh_manager_menu ;;
-        16) backup_restore_menu ;;
-        17) shortcut_manager_menu ;;
+        9) docker_network_manager_menu ;; # <-- 新增的选项
+        10) view_full_status ;;
+        11) detailed_network_monitor_menu ;;
+        12) reset_firewall ;;
+        13) clear_connections ;;
+        14) toggle_ipv4_ping ;;
+        15) toggle_default_policy ;;
+        16) fail2ban_ssh_manager_menu ;;
+        17) backup_restore_menu ;;
+        18) shortcut_manager_menu ;;
         q|Q) echo -e "${CYAN}感谢使用，再见！${NC}"; exit 0 ;;
         *) echo -e "\n${RED}无效的选项，请重新输入。${NC}"; sleep 1 ;;
     esac
