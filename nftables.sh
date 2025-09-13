@@ -1523,6 +1523,7 @@ ssh_whitelist_manager() {
     done
 }
 
+# [最终的、功能最完善的 ssh_change_port 函数]
 ssh_change_port() {
     local ssh_config="/etc/ssh/sshd_config"
     local jail_local="/etc/fail2ban/jail.local"
@@ -1542,72 +1543,68 @@ ssh_change_port() {
     local new_port
     while true; do
         read -p "请输入新的SSH端口号 (1-65535, 'q'取消): " new_port
-        
-        if [[ "$new_port" =~ ^[qQ]$ ]]; then
-            echo -e "\n${YELLOW}操作已取消。${NC}"
-            press_any_key
-            return
-        fi
-
-        if ! [[ "$new_port" =~ ^[0-9]+$ && "$new_port" -ge 1 && "$new_port" -le 65535 ]]; then
-            echo -e "${RED}无效端口号。请输入1-65535之间的数字。${NC}"
-        elif [ "$new_port" -eq "$current_port" ]; then
-            echo -e "${RED}新端口不能与当前端口相同。${NC}"
-        elif ss -tlnp | grep -q ":${new_port}\s"; then
-            echo -e "${RED}端口 ${new_port} 已被其他进程占用。${NC}"
-        else
-            break
-        fi
+        if [[ "$new_port" =~ ^[qQ]$ ]]; then echo -e "\n${YELLOW}操作已取消。${NC}"; press_any_key; return; fi
+        if ! [[ "$new_port" =~ ^[0-9]+$ && "$new_port" -ge 1 && "$new_port" -le 65535 ]]; then echo -e "${RED}无效端口号。${NC}";
+        elif [ "$new_port" -eq "$current_port" ]; then echo -e "${RED}新端口不能与当前端口相同。${NC}";
+        elif ss -tlnp | grep -q ":${new_port}\s"; then echo -e "${RED}端口 ${new_port} 已被其他进程占用。${NC}";
+        else break; fi
     done
     
     echo -e "\n${RED}========================[ 严重警告 ]========================${NC}"
     echo -e "${YELLOW}您确定要将SSH端口从 ${GREEN}${current_port}${YELLOW} 更改为 ${GREEN}${new_port}${YELLOW} 吗?${NC}"
-    echo -e "此脚本将自动执行以下操作:"
-    echo -e " 1. 备份并修改 ${CYAN}${ssh_config}${NC}"
-    echo -e " 2. 更新 ${CYAN}nftables${NC} 防火墙规则以允许新端口"
-    echo -e " 3. 更新 ${CYAN}Fail2ban${NC} 配置以监控新端口"
-    echo -e " 4. 重启 sshd 和 fail2ban 服务"
-    echo -e "${RED}请确保您已记下新端口号！操作失误可能导致无法连接服务器！${NC}"
-    echo -e "${PURPLE}==========================================================${NC}"
     read -p "请输入 'yes' 以确认继续: " confirm
     if [[ "$confirm" != "yes" ]]; then echo -e "\n${YELLOW}操作已取消。${NC}"; press_any_key; return; fi
 
     echo -e "\n${YELLOW}1. 正在备份并修改SSH配置...${NC}"
     cp "$ssh_config" "${ssh_config}.bak.$(date +%F-%T)"
-    if grep -q -i "^\s*Port\s" "$ssh_config"; then
-        sed -i "s/^\s*Port\s.*/Port ${new_port}/" "$ssh_config"
-    else
-        echo -e "\nPort ${new_port}" >> "$ssh_config"
-    fi
+    if grep -q -i "^\s*Port\s" "$ssh_config"; then sed -i "s/^\s*Port\s.*/Port ${new_port}/" "$ssh_config"; else echo -e "\nPort ${new_port}" >> "$ssh_config"; fi
     echo -e "${GREEN}  -> 完成。${NC}"
 
     echo -e "\n${YELLOW}2. 正在更新 nftables 防火墙规则...${NC}"
-    local ssh_rule_handles=($(nft --handle list chain inet "${TABLE_NAME}" "${INPUT_CHAIN}" | grep '"核心:允许SSH"' | awk '{print $NF}'))
+    
+    # 新增逻辑：检查并继承“仅IPv4”状态
+    local is_ipv4_only=false
+    local old_rule_text=$(nft --handle list chain inet "${TABLE_NAME}" "${INPUT_CHAIN}" | grep '"核心:允许SSH' | head -n 1)
+    if [[ "$old_rule_text" == *"meta nfproto ipv4"* ]]; then
+        is_ipv4_only=true
+        echo -e "${CYAN}  -> 检测到当前SSH规则为“仅IPv4”模式，将保持此设置。${NC}"
+    fi
+
+    # 使用修正后的grep查找所有相关的旧规则
+    local ssh_rule_handles=($(nft --handle list chain inet "${TABLE_NAME}" "${INPUT_CHAIN}" | grep '"核心:允许SSH' | awk '{print $NF}'))
     if [ ${#ssh_rule_handles[@]} -gt 0 ]; then
         for handle in "${ssh_rule_handles[@]}"; do
             echo -e "${CYAN}  -> 删除旧规则 (Handle: ${handle})...${NC}"
             nft delete rule inet "${TABLE_NAME}" "${INPUT_CHAIN}" handle "$handle"
         done
-    else
-        echo -e "${YELLOW}  -> 未找到旧的SSH核心规则, 将直接添加新规则。${NC}"
     fi
-    echo -e "${CYAN}  -> 添加新端口 ${new_port} 的放行规则...${NC}"
-    nft add rule inet "${TABLE_NAME}" "${INPUT_CHAIN}" tcp dport "$new_port" accept comment "\"核心:允许SSH\""
-    apply_and_save_changes 0 "更新SSH端口防火墙规则" false
+    
+    echo -e "${CYAN}  -> 正在将新端口规则添加到正确位置...${NC}"
+    local jump_handle=$(nft --handle list chain inet "${TABLE_NAME}" "${INPUT_CHAIN}" | grep '"跳转到用户入站规则主链"' | awk '{print $NF}')
+    local final_status=0
+
+    # 根据之前检测到的状态，添加正确的规则
+    if $is_ipv4_only; then
+        local comment="\"核心:允许SSH (IPv4 Only)\""
+        if [[ -n "$jump_handle" ]]; then
+            nft insert rule inet "${TABLE_NAME}" "${INPUT_CHAIN}" handle "$jump_handle" meta nfproto ipv4 tcp dport "$new_port" accept comment "$comment" || final_status=1
+        else
+            nft add rule inet "${TABLE_NAME}" "${INPUT_CHAIN}" meta nfproto ipv4 tcp dport "$new_port" accept comment "$comment" || final_status=1
+        fi
+    else
+        local comment="\"核心:允许SSH\""
+        if [[ -n "$jump_handle" ]]; then
+            nft insert rule inet "${TABLE_NAME}" "${INPUT_CHAIN}" handle "$jump_handle" tcp dport "$new_port" accept comment "$comment" || final_status=1
+        else
+            nft add rule inet "${TABLE_NAME}" "${INPUT_CHAIN}" tcp dport "$new_port" accept comment "$comment" || final_status=1
+        fi
+    fi
+    apply_and_save_changes $final_status "更新SSH端口防火墙规则" false
     echo -e "${GREEN}  -> 完成。${NC}"
 
     echo -e "\n${YELLOW}3. 正在更新 Fail2ban 配置...${NC}"
-    if [ -f "$jail_local" ] && grep -q '\[sshd\]' "$jail_local"; then
-        if awk '/\[sshd\]/{f=1} f && /port\s*=/ {print; f=0}' "$jail_local" | grep -q port; then
-            sed -i "/\[sshd\]/,/\[.*\]/ s/^\s*port\s*=.*/port = ${new_port}/" "$jail_local"
-        else
-            sed -i "/\[sshd\]/a port = ${new_port}" "$jail_local"
-        fi
-        echo -e "${GREEN}  -> 完成。${NC}"
-    else
-        echo -e "${YELLOW}  -> 未找到 [sshd] jail 配置, 跳过。${NC}"
-    fi
-
+    if [ -f "$jail_local" ] && grep -q '\[sshd\]' "$jail_local"; then if awk '/\[sshd\]/{f=1} f && /port\s*=/ {print; f=0}' "$jail_local" | grep -q port; then sed -i "/\[sshd\]/,/\[.*\]/ s/^\s*port\s*=.*/port = ${new_port}/" "$jail_local"; else sed -i "/\[sshd\]/a port = ${new_port}" "$jail_local"; fi; echo -e "${GREEN}  -> 完成。${NC}"; else echo -e "${YELLOW}  -> 未找到 [sshd] jail 配置, 跳过。${NC}"; fi
+    
     echo -e "\n${YELLOW}4. 正在重启服务...${NC}"
     echo -e "${CYAN}  -> 重启 sshd 服务...${NC}"
     if ! systemctl restart sshd; then
@@ -1617,8 +1614,9 @@ ssh_change_port() {
         echo -e "配置文件备份在: ${ssh_config}.bak.*"
         echo -e "防火墙规则已回滚, 您当前连接应该安全。请勿断开！${NC}"
         # 回滚防火墙操作
-        nft delete rule inet "${TABLE_NAME}" "${INPUT_CHAIN}" tcp dport "$new_port" comment "\"核心:允许SSH\"" &>/dev/null
-        nft add rule inet "${TABLE_NAME}" "${INPUT_CHAIN}" tcp dport "$current_port" accept comment "\"核心:允许SSH\""
+        local old_rule_body=""
+        if $is_ipv4_only; then old_rule_body="meta nfproto ipv4 tcp dport ${current_port} accept comment '\"核心:允许SSH (IPv4 Only)\"'"; else old_rule_body="tcp dport ${current_port} accept comment '\"核心:允许SSH\"'"; fi
+        if [[ -n "$jump_handle" ]]; then nft insert rule inet "${TABLE_NAME}" "${INPUT_CHAIN}" handle "$jump_handle" $old_rule_body; else nft add rule inet "${TABLE_NAME}" "${INPUT_CHAIN}" $old_rule_body; fi
         apply_and_save_changes 0 "SSH端口修改失败, 回滚防火墙" false
         press_any_key; return
     fi
