@@ -963,6 +963,60 @@ toggle_default_policy() {
         apply_and_save_changes $? "切换默认策略为 DROP"
     fi
 }
+# [请将这个新函数完整地添加到您的脚本中]
+toggle_forward_policy() {
+    clear
+    echo -e "${BLUE}--- 切换转发链 (FORWARD) 默认策略 ---${NC}\n"
+
+    # 定义“绿色通道”规则的唯一备注
+    local FORWARD_CT_ACCEPT_COMMENT="核心:允许转发已建立的连接"
+
+    # 获取当前策略和“绿色通道”规则的句柄
+    local current_policy=$(nft list chain inet ${TABLE_NAME} ${FORWARD_CHAIN} 2>/dev/null | grep -o 'policy \w*' | awk '{print $2}')
+    local ct_rule_handle=$(nft --handle list chain inet "${TABLE_NAME}" "${FORWARD_CHAIN}" | grep "${FORWARD_CT_ACCEPT_COMMENT}" | awk '{print $NF}')
+
+    if [[ "$current_policy" == "accept" ]]; then
+        echo -e "${YELLOW}您准备将转发策略从 ${GREEN}ACCEPT (默认/兼容模式)${YELLOW} 切换为 ${RED}DROP (默认拒绝/更严格模式)${YELLOW}。${NC}"
+        echo -e "此操作将会："
+        echo -e "  1. 设置 ${FORWARD_CHAIN} 链的默认策略为 ${RED}DROP${NC}。"
+        echo -e "  2. ${GREEN}自动在链的顶部添加一条规则，以允许“已建立/相关”的连接通过${NC}，确保容器出站网络正常。"
+        echo -e "  3. ${RED}切换后，所有未经您明确放行的新转发流量（如访问容器）都将被拒绝。${NC}"
+        read -p "我已了解影响, 确定要切换到 DROP 模式吗? (y/N): " confirm
+
+        if [[ "$confirm" =~ ^[yY]$ ]]; then
+            echo -e "\n${YELLOW}正在切换策略为 ${RED}DROP${YELLOW}...${NC}"
+            local final_status=0
+            # 首先，如果“绿色通道”规则不存在，就添加它
+            if [[ -z "$ct_rule_handle" ]]; then
+                echo -e "${CYAN}  -> 正在添加“已建立连接”的放行规则...${NC}"
+                nft insert rule inet "${TABLE_NAME}" "${FORWARD_CHAIN}" ct state established,related accept comment "\"${FORWARD_CT_ACCEPT_COMMENT}\"" || final_status=1
+            fi
+            # 然后，更改策略
+            if [[ "$final_status" -eq 0 ]]; then
+                nft chain inet "${TABLE_NAME}" "${FORWARD_CHAIN}" { policy drop \; } || final_status=1
+            fi
+            apply_and_save_changes $final_status "切换转发策略为 DROP (严格)"
+        else
+            echo -e "\n${GREEN}操作已取消。${NC}"; press_any_key
+        fi
+    else # current policy is drop
+        echo -e "${GREEN}当前策略为 ${RED}DROP(严格)${GREEN}, 正在切换回 ${GREEN}ACCEPT (默认/兼容模式)${GREEN}...${NC}"
+        read -p "确认切换吗? (y/N): " confirm
+         if [[ "$confirm" =~ ^[yY]$ ]]; then
+            local final_status=0
+            # 首先，更改策略
+            nft chain inet "${TABLE_NAME}" "${FORWARD_CHAIN}" { policy accept \; } || final_status=1
+            # 然后，如果“绿色通道”规则存在，就移除它（在ACCEPT模式下不再需要）
+            if [[ -n "$ct_rule_handle" ]]; then
+                echo -e "${CYAN}  -> 正在移除“已建立连接”的放行规则...${NC}"
+                nft delete rule inet "${TABLE_NAME}" "${FORWARD_CHAIN}" handle "$ct_rule_handle" || final_status=1
+            fi
+            apply_and_save_changes $final_status "切换转发策略为 ACCEPT (兼容)"
+        else
+            echo -e "\n${GREEN}操作已取消。${NC}"; press_any_key
+        fi
+    fi
+}
 
 # --- Fail2ban & SSH Manager ---
 # MODIFIED: Major changes to implement your desired logic.
@@ -2684,6 +2738,9 @@ initialize_firewall() {
         if [[ -n "$docker_interfaces" ]]; then
             echo -e "${CYAN}检测到Docker网络接口: ${docker_interfaces}, 正在自动添加转发过滤规则...${NC}"
             nft add rule inet ${TABLE_NAME} ${FORWARD_CHAIN} oifname { $(echo ${docker_interfaces} | tr ' ' ',') } jump ${DOCKER_CHAIN} comment "\"跳转到Docker过滤链\""
+            nft add rule inet ${TABLE_NAME} ${FORWARD_CHAIN} iifname { $(echo ${docker_interfaces} | tr ' ' ',') } jump ${USER_OUT_IP_BLOCK} comment "\"跳转到主机出站IP封锁链(Docker共用)\""
+            nft add rule inet ${TABLE_NAME} ${FORWARD_CHAIN} iifname { $(echo ${docker_interfaces} | tr ' ' ',') } jump ${USER_OUT_PORT_BLOCK} comment "\"跳转到主机出站端口封锁链(Docker共用\""
+            nft add rule inet ${TABLE_NAME} ${FORWARD_CHAIN} iifname { $(echo ${docker_interfaces} | tr ' ' ',') } accept comment "\"默认允许容器出站(未被阻止的)\""
         fi
 
         # --- 配置用户规则链内部优先级 ---
@@ -3213,13 +3270,16 @@ main_menu() {
     else
         f2b_status_text="(状态: ${RED}未安装${NC})"
     fi
+    local policy_forward=$(nft list chain inet ${TABLE_NAME} ${FORWARD_CHAIN} 2>/dev/null | grep -o 'policy \w*' | awk '{print $2}')
+    local policy_forward_color;
+    if [[ "$policy_forward" == "drop" ]]; then policy_forward_color="${RED}"; else policy_forward_color="${GREEN}"; fi
 
     clear
     echo -e "${PURPLE}======================================================${NC}"
     echo -e "         ${CYAN}NFTables 防火墙管理器 (By cnyun.de v 1.0)${NC}"
     echo -e "${PURPLE}--------------------[ 系统状态 ]----------------------${NC}"
-    echo -e " 入站策略: ${policy_input_color}${policy_input}${NC}  | 出站策略: ${YELLOW}${policy_output}${NC}  | 转发: ${forward_status}"
-    echo -e " 开机自启: ${autostart_status} | Ping(IPv4): ${ipv4_ping_status} | SSH端口: ${ssh_port_info}"
+    echo -e " 入站策略: ${policy_input_color}${policy_input}${NC}  | 出站策略: ${YELLOW}${policy_output}${NC}  | 内核转发: ${forward_status}"
+    echo -e " 开机自启: ${autostart_status} | Ping(IPv4): ${ipv4_ping_status} | SSH端口: ${ssh_port_info} \n FORWARD转发策略: ${policy_forward_color}${policy_forward}${NC}"
     echo -e "${PURPLE}======================================================${NC}"
     echo -e "${BLUE}--- 规则管理 (主机) ---${NC}"
     echo -e " ${GREEN}1.${NC} 新增 IP 到主机白名单"
@@ -3233,15 +3293,16 @@ main_menu() {
     echo -e " ${GREEN}8.${NC} ${YELLOW}轻量级端口转发 (socat)${NC}"
     echo -e " ${GREEN}9.${NC} ${CYAN}Docker 网络管理${NC}"
     echo -e "\n${BLUE}--- 系统 & 监控 & 附加功能 ---${NC}"
-    echo -e " ${GREEN}10.${NC} ${CYAN}查看完整防火墙状态${NC}"
+    echo -e " ${GREEN}10.${NC} 查看完整防火墙状态"
     echo -e " ${GREEN}11.${NC} ${YELLOW}超级网络监控 (多维度实时视图)${NC}"
     echo -e " ${GREEN}12.${NC} ${RED}重置防火墙为默认结构${NC}"
-    echo -e " ${GREEN}13.${NC} ${YELLOW}清除连接状态 (Conntrack)${NC}"
+    echo -e " ${GREEN}13.${NC} 清除连接状态 (Conntrack)"
     echo -e " ${GREEN}14.${NC} 切换 IPv4 ICMP (Ping) 状态 (当前: ${ipv4_ping_status_text})"
-    echo -e " ${GREEN}15.${NC} ${RED}切换默认入站策略${NC} ${policy_menu_status}"
-    echo -e " ${GREEN}16.${NC} ${CYAN}Fail2ban与SSH综合管理${NC} ${f2b_status_text}"
-    echo -e " ${GREEN}17.${NC} ${YELLOW}备份与恢复规则${NC}"
-    echo -e " ${GREEN}18.${NC} ${YELLOW}终端快捷方式管理${NC} ${shortcut_status_text}"
+    echo -e " ${GREEN}15.${NC} ${RED}切换默认入站策略 (Input)${NC} ${policy_menu_status}"
+    echo -e " ${GREEN}16.${NC} ${RED}切换默认转发策略 (Forward)${NC} (当前: ${policy_forward_color}${policy_forward}${NC})" # <-- 新增行
+    echo -e " ${GREEN}17.${NC} ${CYAN}Fail2ban与SSH综合管理${NC} ${f2b_status_text}" # <-- 编号+1
+    echo -e " ${GREEN}18.${NC} ${YELLOW}备份与恢复规则${NC}" # <-- 编号+1
+    echo -e " ${GREEN}19.${NC} ${YELLOW}终端快捷方式管理${NC} ${shortcut_status_text}" # <-- 编号+1
     echo -e "\n${PURPLE}------------------------------------------------------${NC}"
     echo -e " ${GREEN}q.${NC} 退出脚本"
     echo -e "${PURPLE}------------------------------------------------------${NC}"
@@ -3279,9 +3340,10 @@ while true; do
         13) clear_connections ;;
         14) toggle_ipv4_ping ;;
         15) toggle_default_policy ;;
-        16) fail2ban_ssh_manager_menu ;;
-        17) backup_restore_menu ;;
-        18) shortcut_manager_menu ;;
+        16) toggle_forward_policy ;; # <-- 新增行
+        17) fail2ban_ssh_manager_menu ;; # <-- 编号+1
+        18) backup_restore_menu ;; # <-- 编号+1
+        19) shortcut_manager_menu ;; # <-- 编号+1
         q|Q) echo -e "${CYAN}感谢使用，再见！${NC}"; exit 0 ;;
         *) echo -e "\n${RED}无效的选项，请重新输入。${NC}"; sleep 1 ;;
     esac
