@@ -3307,6 +3307,66 @@ main_menu() {
 }
 
 initialize_firewall
+# =================================================================
+# ### 新增：脚本启动时动态检查并修复 Docker 规则 (最终修正版) ###
+# =================================================================
+
+echo -e "${CYAN}--- 正在进行启动时动态检查... ---${NC}"
+
+# 1. 使用您已验证过的 awk 命令来检测接口，并清理输出
+docker_interfaces=$(ip -o link show type bridge | awk -F': ' '/docker|br-/ {print $2}' | cut -d'@' -f1 | tr '\n' ' ' | sed 's/ *$//')
+
+# 2. 检查forward链中是否已存在我们的Docker跳转规则
+docker_rule_exists=$(nft list chain inet filter forward 2>/dev/null | grep -c '"跳转到Docker入站过滤链"')
+
+# 3. 根据状态进行判断和操作
+if [[ -n "$docker_interfaces" && "$docker_rule_exists" -eq 0 ]]; then
+    # 情况一: Docker在运行，但我们的规则不存在 -> 自动补上
+    echo -e "${YELLOW}检测到 Docker 正在运行 (接口: ${docker_interfaces})，但防火墙缺少规则...${NC}"
+    echo -e "${CYAN}--> 正在为您自动添加...${NC}"
+    
+    # 将接口名格式化为nftables集合
+    nft_iface_set="{ $(echo ${docker_interfaces} | tr ' ' ',') }"
+    
+    # 为安全起见，先清理可能残留的旧规则
+    old_handles=$(nft --handle list chain inet filter forward 2>/dev/null | grep -E '"跳转到Docker|跳转到主机出站' | awk '{print $NF}')
+    if [[ -n "$old_handles" ]]; then
+        for handle in $(echo "$old_handles" | sort -nr); do
+            nft delete rule inet filter forward handle "$handle"
+        done
+    fi
+
+    # 添加完整的、正确的规则集
+    nft add rule inet ${TABLE_NAME} ${FORWARD_CHAIN} oifname ${nft_iface_set} jump ${DOCKER_CHAIN} comment "\"跳转到Docker入站过滤链\""
+    nft add rule inet ${TABLE_NAME} ${FORWARD_CHAIN} iifname ${nft_iface_set} jump ${USER_OUT_IP_BLOCK} comment "\"跳转到主机出站IP封锁链(Docker共用)\""
+    nft add rule inet ${TABLE_NAME} ${FORWARD_CHAIN} iifname ${nft_iface_set} jump ${USER_OUT_PORT_BLOCK} comment "\"跳转到主机出站端口封锁链(Docker共用)\""
+    nft add rule inet ${TABLE_NAME} ${FORWARD_CHAIN} iifname ${nft_iface_set} accept comment "\"默认允许容器出站(未被阻止的)\""
+    
+    echo -e "${GREEN}--> Docker 转发规则已自动修复并添加成功！正在保存...${NC}"
+    nft list ruleset > ${NFT_CONF_PATH}
+    sleep 2
+
+elif [[ -z "$docker_interfaces" && "$docker_rule_exists" -ne 0 ]]; then
+    # 情况二: Docker已停止，但规则还在 -> 自动清理
+    echo -e "${YELLOW}检测到 Docker 未运行，但防火墙中存在残留的转发规则...${NC}"
+    echo -e "${CYAN}--> 正在为您自动清理...${NC}"
+    
+    old_handles=$(nft --handle list chain inet filter forward 2>/dev/null | grep -E '"跳转到Docker|跳转到主机出站' | awk '{print $NF}')
+    if [[ -n "$old_handles" ]]; then
+        for handle in $(echo "$old_handles" | sort -nr); do
+            nft delete rule inet filter forward handle "$handle"
+        done
+    fi
+    
+    echo -e "${GREEN}--> 残留的 Docker 转发规则已自动清理！正在保存...${NC}"
+    nft list ruleset > ${NFT_CONF_PATH}
+    sleep 2
+
+else
+    # 情况三: 状态一致，无需操作
+    echo -e "${GREEN}Docker 状态与防火墙规则一致，无需操作。${NC}"
+fi
+echo -e "${CYAN}------------------------------------${NC}\n"
 while true; do
     main_menu
     read -p "请输入您的选项: " choice
