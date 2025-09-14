@@ -384,7 +384,7 @@ EOF
 
 
 #================================================
-# 主执行流程
+# 函数 6: 【已修正】主执行流程
 #================================================
 main() {
     if [ "$(id -u)" -ne 0 ]; then
@@ -412,7 +412,7 @@ main() {
         exit 1
     fi
 
-    # --- 【新】每次都执行批量添加IP的向导 ---
+    # --- 每次都执行批量添加IP的向导 ---
     # 1. 先清理掉旧的IP块, 避免重复添加
     awk '/# --- START BATCH ADDED IPS ---/{f=1;next} /# --- END BATCH ADDED IPS ---/{f=0;next} !f' "$CONFIG_FILE_PATH" > "${CONFIG_FILE_PATH}.tmp" && mv "${CONFIG_FILE_PATH}.tmp" "$CONFIG_FILE_PATH"
 
@@ -434,7 +434,8 @@ main() {
             generate_random_segment() { openssl rand -hex 2; }
             for (( i=1; i<=20; i++ )); do
                 local suffix="$(generate_random_segment):$(generate_random_segment):$(generate_random_segment):$(generate_random_segment):$(generate_random_segment)"
-                command_block+="sudo ip addr add ${he_sh_prefix_var}:${suffix}/48 dev ${INTERFACE_NAME};\n"
+                # 【已修正】使用转义的 \${INTERFACE_NAME}
+                command_block+="sudo ip addr add ${he_sh_prefix_var}:${suffix}/48 dev \${INTERFACE_NAME};\n"
             done
             ;;
         3)
@@ -444,7 +445,8 @@ main() {
         *) # 默认选项, 包括 1 和直接回车
             echo "  -> 正在使用 20 个预设后缀..."
             for suffix in "${PRESET_SUFFIXES[@]}"; do
-                command_block+="sudo ip addr add ${he_sh_prefix_var}:${suffix}/48 dev ${INTERFACE_NAME};\n"
+                # 【已修正】使用转义的 \${INTERFACE_NAME}
+                command_block+="sudo ip addr add ${he_sh_prefix_var}:${suffix}/48 dev \${INTERFACE_NAME};\n"
             done
             ;;
     esac
