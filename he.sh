@@ -224,16 +224,18 @@ interactive_edit_tunnel() {
 
 
 #================================================
-# 函数 4: 【终极交互版】更新 x-ui 配置
+# 函数 4: 【v30 终极交互修复版】更新 x-ui 配置
 #================================================
 update_xui_config() {
     local new_48_segment="$1"
     local new_ipv6_addr=""
+    local tags_to_update=()
 
+    # --- 交互式向导 Part 1: 选择要使用的IP地址 ---
     echo
     echo "--- 联动更新 x-ui 向导 ---"
-    echo "是否要更新 x-ui 出站 (${XUI_OUTBOUND_TAGS[*]}) 的发送地址?"
-    echo "  y) 是, 使用约定地址 (...:${new_48_segment}:6666:6666)"
+    echo "是否要更新 x-ui 出站的发送地址 (sendThrough)?"
+    echo "  y) 是, 使用约定地址 (...:${new_48_segment}:6666:6666:6666:6666:6666)"
     echo "  e) 是, 从 he-ipv6 网卡上已有的地址中选择一个"
     echo "  n) 否, 跳过本次 x-ui 更新"
     echo "  q) 退出整个脚本"
@@ -246,8 +248,7 @@ update_xui_config() {
             ;;
         e|E)
             echo "  -> 正在扫描 ${INTERFACE_NAME} 网卡上的可用IPv6地址..."
-            # 使用readarray将命令输出读入bash数组
-            readarray -t AVAILABLE_IPS < <(ip -6 addr show dev "${INTERFACE_NAME}" | grep 'scope global' | awk '{print $2}' | cut -d'/' -f1)
+            readarray -t AVAILABLE_IPS < <(ip -6 addr show dev "${INTERFACE_NAME}" 2>/dev/null | grep 'scope global' | awk '{print $2}' | cut -d'/' -f1)
             
             if [ ${#AVAILABLE_IPS[@]} -eq 0 ]; then
                 echo "  -> ❌ 错误: 在 ${INTERFACE_NAME} 网卡上未找到任何可用的公网IPv6地址。无法继续。"
@@ -278,47 +279,60 @@ update_xui_config() {
             ;;
     esac
 
-    echo; echo "🔄 开始联动更新 x-ui 数据库 (安全模式)..."
+    # --- 交互式向导 Part 2: 选择要更新的出站标签 ---
+    if [ -n "$new_ipv6_addr" ]; then
+        echo
+        local default_tags_str=$(echo "${XUI_OUTBOUND_TAGS[*]}")
+        read -p "➡️ 请输入要应用此IP的出站标签 (默认: ${default_tags_str}, 空格分隔): " user_tags
+        
+        if [ -z "$user_tags" ]; then
+            tags_to_update=("${XUI_OUTBOUND_TAGS[@]}")
+            echo "  -> 使用默认出站标签: (${tags_to_update[*]})"
+        else
+            read -r -a tags_to_update <<< "$user_tags"
+            echo "  -> 使用自定义出站标签: (${tags_to_update[*]})"
+        fi
+        
+        if [ ${#tags_to_update[@]} -eq 0 ]; then
+            echo "  -> ⚠️ 未指定任何出站标签，跳过更新。"
+            return
+        fi
+    else
+        return
+    fi
+
+    # --- 核心数据库操作 ---
+    echo; echo "🔄 开始联动更新 x-ui 数据库 (最终安全模式)..."
     if [ ! -f "$XUI_DB_PATH" ]; then echo "ℹ️ 未找到 x-ui 数据库文件: $XUI_DB_PATH。跳过更新。"; return; fi
 
-    # 步骤1: 停止 x-ui 服务
-    echo "  -> 步骤 1/3: 正在停止 '$XUI_SERVICE_NAME' 服务以安全写入数据库..."
+    # 步骤1: 停止服务
+    echo "  -> 步骤 1/4: 正在停止 '$XUI_SERVICE_NAME' 服务以安全读写数据库..."
     if systemctl is-active --quiet "$XUI_SERVICE_NAME"; then
-        systemctl stop "$XUI_SERVICE_NAME"
-        sleep 1
+        systemctl stop "$XUI_SERVICE_NAME"; sleep 1
     fi
     echo "  -> ✔︎ 服务已停止。"
 
-    # 步骤2: 修改数据库
-    echo "  -> 步骤 2/3: 正在修改数据库文件..."
-    local tags_json_array='['
-    for tag in "${XUI_OUTBOUND_TAGS[@]}"; do
-        tags_json_array+="\"$tag\","
-    done
-    tags_json_array="${tags_json_array%,}]"
+    # 步骤2: 从 settings 表读取总配置
+    echo "  -> 步骤 2/4: 正在从数据库 settings 表读取 xrayTemplateConfig..."
+    local xray_config_json=$(sqlite3 "$XUI_DB_PATH" "SELECT value FROM settings WHERE key = 'xrayTemplateConfig';")
+    if [ -z "$xray_config_json" ]; then echo "  -> ❌ 错误: 未能在 settings 表中找到 xrayTemplateConfig。正在重启服务..."; systemctl start "$XUI_SERVICE_NAME"; return; fi
+
+    # 步骤3: 使用 jq 修改
+    echo "  -> 步骤 3/4: 正在使用 jq 在内存中更新出站配置..."
+    local tags_json_array='['; for tag in "${tags_to_update[@]}"; do tags_json_array+="\"$tag\","; done; tags_json_array="${tags_json_array%,}]"
+    local modified_xray_config_json=$(echo "$xray_config_json" | jq --argjson tags "$tags_json_array" --arg ip "$new_ipv6_addr" '( .outbounds[] | select(.tag | IN($tags[])) ) |= (.sendThrough = $ip)')
     
-    local modified_xray_config_json=$(sqlite3 "$XUI_DB_PATH" "SELECT value FROM settings WHERE key = 'xrayTemplateConfig';" | jq --argjson tags "$tags_json_array" --arg ip "$new_ipv6_addr" '( .outbounds[] | select(.tag | IN($tags[])) ) |= (.sendThrough = $ip)')
-    
+    # 步骤4: 写回数据库
+    echo "  -> 步骤 4/4: 正在将修改后的完整配置写回数据库..."
     local escaped_json=$(echo "$modified_xray_config_json" | sed "s/'/''/g")
-    
     sqlite3 "$XUI_DB_PATH" "UPDATE settings SET value = '${escaped_json}' WHERE key = 'xrayTemplateConfig';"
-    
-    if [ $? -ne 0 ]; then
-        echo "❌ 使用 sqlite3 更新数据库失败！请检查错误信息。正在尝试重启服务以恢复..."
-        systemctl start "$XUI_SERVICE_NAME"
-        return
-    fi
+    if [ $? -ne 0 ]; then echo "❌ 使用 sqlite3 写回数据库失败！正在重启服务恢复..."; systemctl start "$XUI_SERVICE_NAME"; return; fi
     echo "  -> ✔︎ 数据库修改成功。"
 
-    # 步骤3: 启动 x-ui 服务
-    echo "  -> 步骤 3/3: 正在启动 '$XUI_SERVICE_NAME' 服务..."
-    systemctl start "$XUI_SERVICE_NAME"
-    sleep 2
-    if systemctl is-active --quiet "$XUI_SERVICE_NAME"; then
-        echo "✔︎ '$XUI_SERVICE_NAME' 服务已成功启动, 新配置已生效！"
-    else
-        echo "❌ '$XUI_SERVICE_NAME' 服务启动失败！请手动检查: sudo systemctl status $XUI_SERVICE_NAME"
-    fi
+    # 启动服务
+    echo "  -> 正在启动 '$XUI_SERVICE_NAME' 服务..."
+    systemctl start "$XUI_SERVICE_NAME"; sleep 2
+    if systemctl is-active --quiet "$XUI_SERVICE_NAME"; then echo "✔︎ '$XUI_SERVICE_NAME' 服务已成功启动, 新配置已生效！"; else echo "❌ '$XUI_SERVICE_NAME' 服务启动失败！请手动检查: sudo systemctl status $XUI_SERVICE_NAME"; fi
 }
 
 
