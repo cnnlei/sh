@@ -32,6 +32,15 @@ PRESET_SUFFIXES=(
     "5e4d:27dd:4cb6:f94:e0bf" "5903:ed2d:948e:65a4:1326"
 )
 
+# --- 【新】IPv6 地址段预设 ---
+# 格式: ("描述1" "64位段1" "48位段1"  "描述2" "64位段2" "48位段2" ...)
+IPV6_SEGMENT_PRESETS=(
+    "朝鲜-lax" "d:8c5" "f57f"
+    "朝鲜-sea" "b:24e" "e950"
+    "南极洲-lax" "d:7c1" "f57e"
+    "危地马拉-lax" "d:909" "f589"
+)
+
 SERVERS=(
     # North America
     "216.66.22.2"     "美国, 阿什本 (Ashburn, VA)"
@@ -165,7 +174,7 @@ EOF
 
 
 #================================================
-# 函数 3: 【v33 优化提示版】交互式编辑给定的配置文件
+# 函数 3: 【v34 预设地址段版】交互式编辑给定的配置文件
 #================================================
 interactive_edit_tunnel() {
     local config_path="$1";
@@ -192,16 +201,41 @@ interactive_edit_tunnel() {
     echo "  - /48 地址段: $current_48"
     echo "  - 隧道服务器: $current_ip ($current_location)"
     echo "--------------------------------------------------"
-    echo "请输入新的配置值。如果某项不想更改，可直接回车。"
-    echo
-    read -p "➡️ 请输入新的 /64 地址段 (例如 c:fa) [$current_64]: " new_64
-    [ -z "$new_64" ] && new_64=$current_64
-    read -p "➡️ 请输入新的 /48 地址段 (例如 f1c0) [$current_48]: " new_48
-    [ -z "$new_48" ] && new_48=$current_48
+
+    # --- 【新】地址段预设选择菜单 ---
+    echo "请选择要使用的 /64 和 /48 地址段组合:"
+    local num_presets=$((${#IPV6_SEGMENT_PRESETS[@]} / 3))
+    for ((i=0; i<$num_presets; i++)); do
+        local desc_idx=$((i * 3))
+        local seg64_idx=$((i * 3 + 1))
+        local seg48_idx=$((i * 3 + 2))
+        printf "  %d) %s (%s / %s)\n" "$((i+1))" "${IPV6_SEGMENT_PRESETS[$desc_idx]}" "${IPV6_SEGMENT_PRESETS[$seg64_idx]}" "${IPV6_SEGMENT_PRESETS[$seg48_idx]}"
+    done
+    echo "  m) 手动输入自定义地址段"
+    read -p "请选择 [1-${num_presets}, m, 直接回车保持当前值不变]: " preset_choice
+
+    local new_64="$current_64"
+    local new_48="$current_48"
+
+    if [[ "$preset_choice" =~ ^[0-9]+$ ]] && [ "$preset_choice" -ge 1 ] && [ "$preset_choice" -le $num_presets ]; then
+        local idx=$(( (preset_choice - 1) * 3 ))
+        new_64="${IPV6_SEGMENT_PRESETS[$idx+1]}"
+        new_48="${IPV6_SEGMENT_PRESETS[$idx+2]}"
+        echo "  -> 已选择预设: ${IPV6_SEGMENT_PRESETS[$idx]}"
+    elif [[ "$preset_choice" == "m" || "$preset_choice" == "M" ]]; then
+        echo "  -> 已选择手动输入:"
+        read -p "    ➡️ 请输入新的 /64 地址段 (例如 c:fa) [$current_64]: " manual_64
+        read -p "    ➡️ 请输入新的 /48 地址段 (例如 f1c0) [$current_48]: " manual_48
+        [ -n "$manual_64" ] && new_64=$manual_64
+        [ -n "$manual_48" ] && new_48=$manual_48
+    else
+        echo "  -> 无效输入或直接回车, 保持当前地址段不变。"
+    fi
+    # --- 地址段选择结束 ---
+
     local new_ip=$current_ip
     local perform_ip_change=false
     if [[ "$current_ip" != "$LA_SERVER_IP" ]]; then
-        # 【已修改】更新这里的提示信息
         read -p "⚠️ 当前服务器不是洛杉矶, 在 ${current_location}, IP是 ${current_ip}。要更换吗? (y/N): " choice
         if [[ "$choice" =~ ^[yY] ]]; then
             perform_ip_change=true
@@ -238,7 +272,6 @@ interactive_edit_tunnel() {
     echo "  - 新服务器IP: $new_ip"
     echo "--------------------------------------------------"
     
-    # 使用更兼容的判断逻辑
     read -p "确认要将以上更改写入 '$config_path' 吗？(Y/n): " confirm
     if [[ "$confirm" == "n" || "$confirm" == "N" ]]; then
         echo "🚫 操作已取消。"
