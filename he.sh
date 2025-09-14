@@ -33,21 +33,47 @@ PRESET_SUFFIXES=(
 )
 
 SERVERS=(
+    # North America
+    "216.66.22.2"     "美国, 阿什本 (Ashburn, VA)"
+    "216.218.200.58"  "加拿大, 卡尔加里 (Calgary, AB)"
+    "184.105.253.14"  "美国, 芝加哥 (Chicago, IL)"
+    "184.105.253.10"  "美国, 达拉斯 (Dallas, TX)"
+    "184.105.250.46"  "美国, 丹佛 (Denver, CO)"
+    "72.52.104.74"    "美国, 弗里蒙特 (Fremont, CA, #1)"
+    "64.62.134.130"   "美国, 弗里蒙特 (Fremont, CA, #2)"
+    "64.71.156.86"    "美国, 檀香山 (Honolulu, HI)"
+    "216.66.77.230"   "美国, 堪萨斯城 (Kansas City, MO)"
     "66.220.18.42"    "美国, 洛杉矶 (Los Angeles, CA)"
-    "216.66.80.30"    "美国, 弗里蒙特 (Fremont, CA)"
-    "216.66.84.42"    "美国, 阿什本 (Ashburn, VA)"
-    "64.62.200.2"     "美国, 纽约 (New York, NY)"
-    "216.66.87.14"    "美国, 芝加哥 (Chicago, IL)"
-    "66.220.7.82"     "美国, 迈阿密 (Miami, FL)"
-    "216.66.88.98"    "美国, 达拉斯 (Dallas, TX)"
-    "216.66.86.114"   "美国, 西雅图 (Seattle, WA)"
-    "209.51.181.2"    "英国, 伦敦 (London, UK)"
-    "195.10.195.10"   "德国, 法兰克福 (Frankfurt, DE)"
-    "216.66.22.2"     "荷兰, 阿姆斯特丹 (Amsterdam, NL)"
-    "216.66.38.58"    "瑞士, 苏黎世 (Zurich, CH)"
-    "103.56.233.1"    "日本, 东京 (Tokyo, JP)"
-    "184.105.251.94"  "中国, 香港 (Hong Kong)"
-    "184.105.220.102" "新加坡 (Singapore)"
+    "209.51.161.58"   "美国, 迈阿密 (Miami, FL)"
+    "209.51.161.14"   "美国, 纽约 (New York, NY)"
+    "66.220.7.82"     "美国, 菲尼克斯 (Phoenix, AZ)"
+    "216.218.226.238" "美国, 西雅图 (Seattle, WA)"
+    "216.66.38.58"    "加拿大, 多伦多 (Toronto, ON)"
+    "184.105.255.26"  "加拿大, 温尼伯 (Winnipeg, MB)"
+    # Europe
+    "216.66.86.114"   "德国, 柏林 (Berlin, DE)"
+    "216.66.87.14"    "匈牙利, 布达佩斯 (Budapest, HU)"
+    "216.66.80.30"    "德国, 法兰克福 (Frankfurt, DE)"
+    "216.66.87.102"   "葡萄牙, 里斯本 (Lisbon, PT)"
+    "216.66.80.26"    "英国, 伦敦 (London, UK, #1)"
+    "216.66.88.98"    "英国, 伦敦 (London, UK, #2)"
+    "216.66.84.42"    "法国, 巴黎 (Paris, FR)"
+    "216.66.86.122"   "捷克, 布拉格 (Prague, CZ)"
+    "216.66.80.90"    "瑞典, 斯德哥尔摩 (Stockholm, SE)"
+    "216.66.80.98"    "瑞士, 苏黎世 (Zurich, CH)"
+    # Asia
+    "216.218.221.6"   "中国, 香港 (Hong Kong)"
+    "216.218.221.42"  "新加坡 (Singapore)"
+    "74.82.46.6"      "日本, 东京 (Tokyo, JP)"
+    # Africa
+    "216.66.87.98"    "吉布提, 吉布提市 (Djibouti City, DJ)"
+    "216.66.87.134"   "南非, 约翰内斯堡 (Johannesburg, ZA)"
+    # South America
+    "216.66.64.154"   "哥伦比亚, 波哥大 (Bogota, CO)"
+    # Oceania
+    "216.218.142.50"  "澳大利亚, 悉尼 (Sydney, NSW)"
+    # Middle East
+    "216.66.90.30"    "阿联酋, 迪拜 (Dubai, AE)"
 )
 # --- 全局配置结束 ---
 
@@ -139,10 +165,10 @@ EOF
 
 
 #================================================
-# 函数 3: 交互式编辑给定的配置文件
+# 函数 3: 【v33 优化提示版】交互式编辑给定的配置文件
 #================================================
 interactive_edit_tunnel() {
-    local config_path="$1"
+    local config_path="$1";
     local current_64=$(grep 'IPV6_ROUTED_64_SEGMENT=' "$config_path" | cut -d'"' -f2)
     local current_48=$(grep 'IPV6_ROUTED_48_SEGMENT=' "$config_path" | cut -d'"' -f2)
     local current_ip=$(grep 'REMOTE_IPV4=' "$config_path" | cut -d'"' -f2)
@@ -153,7 +179,7 @@ interactive_edit_tunnel() {
     echo "=================================================="
     echo "    交互式 HE.net IPv6 隧道配置更新工具"
     echo "=================================================="
-    local current_location="未知"
+    local current_location="未知地点"
     for ((i=0; i<${#SERVERS[@]}; i+=2)); do
         if [[ "${SERVERS[i]}" == "$current_ip" ]]; then
             current_location="${SERVERS[i+1]}"
@@ -175,7 +201,8 @@ interactive_edit_tunnel() {
     local new_ip=$current_ip
     local perform_ip_change=false
     if [[ "$current_ip" != "$LA_SERVER_IP" ]]; then
-        read -p "⚠️ 当前服务器不是洛杉矶, 要更换吗? (y/N): " choice
+        # 【已修改】更新这里的提示信息
+        read -p "⚠️ 当前服务器不是洛杉矶, 在 ${current_location}, IP是 ${current_ip}。要更换吗? (y/N): " choice
         if [[ "$choice" =~ ^[yY] ]]; then
             perform_ip_change=true
         fi
@@ -210,11 +237,14 @@ interactive_edit_tunnel() {
     echo "  - 新 /48 段: $new_48"
     echo "  - 新服务器IP: $new_ip"
     echo "--------------------------------------------------"
+    
+    # 使用更兼容的判断逻辑
     read -p "确认要将以上更改写入 '$config_path' 吗？(Y/n): " confirm
-    if [[ "$confirm" =~ ^[nN]$ ]]; then
+    if [[ "$confirm" == "n" || "$confirm" == "N" ]]; then
         echo "🚫 操作已取消。"
         return 1
     fi
+
     echo "⚙️ 正在更新配置文件: $config_path ..."
     sed -i.bak -e "s/REMOTE_IPV4=\".*\"/REMOTE_IPV4=\"$new_ip\"/" -e "s/IPV6_ROUTED_64_SEGMENT=\".*\"/IPV6_ROUTED_64_SEGMENT=\"$new_64\"/" -e "s/IPV6_ROUTED_48_SEGMENT=\".*\"/IPV6_ROUTED_48_SEGMENT=\"$new_48\"/" "$config_path"
     echo "✔︎ 配置文件更新完毕！原始文件已备份为 ${config_path}.bak"
@@ -435,7 +465,7 @@ main() {
             for (( i=1; i<=20; i++ )); do
                 local suffix="$(generate_random_segment):$(generate_random_segment):$(generate_random_segment):$(generate_random_segment):$(generate_random_segment)"
                 # 【已修正】使用转义的 \${INTERFACE_NAME}
-                command_block+="sudo ip addr add ${he_sh_prefix_var}:${suffix}/48 dev \${INTERFACE_NAME};\n"
+                command_block+="ip addr add ${he_sh_prefix_var}:${suffix}/48 dev \${INTERFACE_NAME};\n"
             done
             ;;
         3)
@@ -446,7 +476,7 @@ main() {
             echo "  -> 正在使用 20 个预设后缀..."
             for suffix in "${PRESET_SUFFIXES[@]}"; do
                 # 【已修正】使用转义的 \${INTERFACE_NAME}
-                command_block+="sudo ip addr add ${he_sh_prefix_var}:${suffix}/48 dev \${INTERFACE_NAME};\n"
+                command_block+="ip addr add ${he_sh_prefix_var}:${suffix}/48 dev \${INTERFACE_NAME};\n"
             done
             ;;
     esac
