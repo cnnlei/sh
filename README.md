@@ -70,6 +70,17 @@ bash he.sh
 ```
 
 
+# ipv6生成便捷脚本
+## 一键运行
+
+请使用 `root` 用户或有 `sudo` 权限的用户，在终端中执行以下命令：
+
+```bash
+wget https://raw.githubusercontent.com/cnnlei/sh/main/ipv6.sh
+bash ipv6.sh
+```
+
+
 
 
 
