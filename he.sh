@@ -467,6 +467,8 @@ main() {
         chmod +x "$CONFIG_FILE_PATH"
         echo "✔︎ 基础模板生成成功。"
     fi
+    # 无论文件是否存在，每次运行都确保它有执行权限
+    chmod +x "$CONFIG_FILE_PATH"
     echo
     interactive_edit_tunnel "$CONFIG_FILE_PATH"
     if [ $? -ne 0 ]; then
@@ -523,6 +525,10 @@ main() {
         echo "✔︎ 批量地址命令已成功更新到 '$CONFIG_FILE_PATH'。"
     fi
     # --- 向导结束 ---
+    # 【关键改动 2】在所有文件写入操作都完成后，最后一步，统一设置执行权限！
+    echo "⚙️ [Final Step] 正在确保配置文件 '${CONFIG_FILE_PATH}' 具有可执行权限..."
+    chmod +x "$CONFIG_FILE_PATH"
+    echo "✔︎ 权限设置完成。"
 
     echo
     read -p "✅ 配置已更新, 是否立即执行 '$CONFIG_FILE_PATH' 来应用网络设置? (Y/n): " choice
