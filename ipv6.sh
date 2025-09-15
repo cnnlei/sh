@@ -231,16 +231,32 @@ run_configuration() {
             new_ip="${DISPLAY_PREFIX}:${PART5}:${PART6}:${PART7}:${PART8}"
             generated_ips+=("$new_ip")
         done
-        if [ "$op_mode" == "add" ]; then final_ips+=("${generated_ips[@]}"); else final_ips=("${generated_ips[@]}"); fi
-        read -p "将配置 ${#final_ips[@]} 个IP。确认继续吗？ [y/N]: " confirm
+        
+        # 增加 IP 地址列表预览
+        if [ "$op_mode" == "add" ]; then
+            echo "将执行以下操作："
+            echo "  [+] 将添加以下 ${#generated_ips[@]} 个新IP:"
+            printf "      -> %s\n" "${generated_ips[@]}"
+            final_ips+=("${generated_ips[@]}")
+        else
+            echo "将执行以下操作："
+            echo "  [+] 将添加以下 ${#generated_ips[@]} 个新IP:"
+            printf "      -> %s\n" "${generated_ips[@]}"
+            if [ ${#existing_ips[@]} -gt 0 ]; then
+                echo "  [-] 将移除以下 ${#existing_ips[@]} 个旧IP:"
+                printf "      -> %s\n" "${existing_ips[@]}"
+            fi
+            final_ips=("${generated_ips[@]}")
+        fi
+
+        read -p "确认继续吗？ [y/N]: " confirm
         if [[ ! "$confirm" =~ ^[yY] ]]; then echo "操作已取消。"; return; fi
+        
         echo "正在应用配置..."
         if [ "$op_mode" == "overwrite" ] && [ ${#existing_ips[@]} -gt 0 ]; then
             for ip in "${existing_ips[@]}"; do ip addr del "${ip}/${PREFIX_LEN}" dev "$IFACE" 2>/dev/null; done
         fi
-        ips_to_add=()
-        if [ "$op_mode" == "add" ]; then ips_to_add=("${generated_ips[@]}"); else ips_to_add=("${final_ips[@]}"); fi
-        for ip in "${ips_to_add[@]}"; do if ! ip addr show dev "$IFACE" | grep -q "$ip"; then ip addr add "${ip}/${PREFIX_LEN}" dev "$IFACE"; fi; done
+        for ip in "${generated_ips[@]}"; do if ! ip addr show dev "$IFACE" | grep -q "$ip"; then ip addr add "${ip}/${PREFIX_LEN}" dev "$IFACE"; fi; done
         ;;
     esac
 
